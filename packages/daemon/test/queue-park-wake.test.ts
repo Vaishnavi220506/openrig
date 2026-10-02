@@ -600,7 +600,58 @@ describe("S03 R25 — a park records its wake on the append-only transition", ()
         } else {
           expect(jobs.getById(ref)?.state).toBe("terminal");
         }
+      } else {
+        expect(jobs.getById(ref)).toMatchObject({ state: "active", intervalSeconds: sharedJob.intervalSeconds,
+          specYaml: sharedJob.specYaml });
+        expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).outcome.action).toBe("terminal");
+        expect(jobs.getById(ref)?.state).toBe("terminal");
+        expect(deliveries).toHaveLength(1);
       }
+    },
+  );
+
+  it.each([false, true])("retires a shared timer after its attachment leaves park (repeating=%s)", async repeating => {
+    repo.attachWatchdogJobsRepository(jobs);
+    const owner = "shared-owner@rig";
+    const row = await item(owner);
+    repo.update({ qitemId: row.qitemId, actorSession: owner, state: "blocked",
+      blockedOn: "external:first", transitionNote: "timer park", wakeAfterSeconds: 30,
+      ...(repeating ? { wakeMaxSeconds: 120 } : {}) });
+    const ref = repo.getParkWakeStatus(row.qitemId)!.ref;
+    const attached = await item(owner);
+    repo.update({ qitemId: attached.qitemId, actorSession: owner, state: "blocked",
+      blockedOn: "external:second", transitionNote: "shared park", wakeWatchdogId: ref });
+    repo.claim({ qitemId: row.qitemId, destinationSession: owner });
+    repo.claim({ qitemId: attached.qitemId, destinationSession: owner });
+    const deliver = vi.fn(async () => ({ status: "ok" as const }));
+    const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: new WatchdogHistoryLog(db), eventBus: bus,
+      resolveQueueWait: input => repo.evaluateWaitReminder(input),
+      resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
+      onWakeAttempt: ({ jobId, deliveryStatus }) => repo.recordWatchdogWakeAttempt(jobId, deliveryStatus), deliver });
+    expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).outcome.action).toBe("terminal");
+    expect(jobs.getById(ref)?.state).toBe("terminal");
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
+  it.each((["left", "superseded", "fired"] as const)
+    .flatMap(attachment => [false, true].map(repeating => ({ attachment, repeating }))))(
+    "ignores a $attachment attachment when retiring its timer (repeating=$repeating)", async ({ attachment, repeating }) => {
+      repo.attachWatchdogJobsRepository(jobs);
+      const owner = "shared-owner@rig";
+      const row = await item(owner);
+      repo.update({ qitemId: row.qitemId, actorSession: owner, state: "blocked",
+        blockedOn: "external:first", transitionNote: "timer park", wakeAfterSeconds: 30,
+        ...(repeating ? { wakeMaxSeconds: 120 } : {}) });
+      const ref = repo.getParkWakeStatus(row.qitemId)!.ref;
+      const attached = await item(owner);
+      repo.update({ qitemId: attached.qitemId, actorSession: owner, state: "blocked",
+        blockedOn: "external:second", transitionNote: "shared park", wakeWatchdogId: ref });
+      if (attachment === "left") repo.claim({ qitemId: attached.qitemId, destinationSession: owner });
+      else if (attachment === "superseded") repo.update({ qitemId: attached.qitemId, actorSession: owner,
+        state: "blocked", blockedOn: "external:third", transitionNote: "new wake", wakeAfterSeconds: 60 });
+      else repo.recordWatchdogWakeAttempt(ref, "ok");
+      repo.claim({ qitemId: row.qitemId, destinationSession: owner });
+      expect(jobs.getById(ref)?.state).toBe("terminal");
     },
   );
 
