@@ -431,7 +431,8 @@ exit 1
   });
 
   it("keeps the trace script's no-baton text equal to the daemon's refusal", () => {
-    const loaded = spawnSync("python3", ["-c", [
+    // -B: importing the script must not write __pycache__ into the shipped skill, which the pack build rejects.
+    const loaded = spawnSync("python3", ["-B", "-c", [
       "import importlib.util, sys",
       "spec = importlib.util.spec_from_file_location('trace_to_root', sys.argv[1])",
       "module = importlib.util.module_from_spec(spec)",
