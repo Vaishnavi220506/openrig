@@ -5,8 +5,9 @@ advisory. Every pull request to `main` runs `.github/workflows/tests.yml` on a c
 runner: build and packaging, typecheck, the repository scripts (`npm run test:repo`), each
 workspace's test suite (daemon, cli, tui and ui) on macOS without ambient credentials or
 external network, and an installed-package scenario (`scripts/run-pr-scenarios.sh`). The root
-`package.json` scripts below run the same checks locally, with one difference: `npm test` does
-not include the UI suite, which CI runs as `package-tests (ui)`. Run `npm run test:ui` for it.
+`package.json` scripts below run the same build, typecheck, repository and test checks locally,
+with one difference: `npm test` does not include the UI suite, which CI runs as
+`package-tests (ui)`. Run `npm run test:ui` for it.
 
 ## Blocking gates (must pass before a candidate moves)
 
@@ -32,8 +33,8 @@ suite. Both sets are readable in the root `package.json` scripts.
 Daemon API changes no longer require browser or interaction verification of the UI, and
 the contract mirrors under `packages/ui/src/hooks/` are no longer proactively maintained. A
 new `test:ui` failure usually signals a moved API contract. Because pull-request CI runs the
-UI suite as `package-tests (ui)`, the change that moves the contract also updates the affected
-UI test or mirror.
+UI suite as `package-tests (ui)`, the change that moves the contract has to update the affected
+UI test or mirror to pass that check.
 
 Browser/interaction testing of the web UI is not a contributor gate. (The packaged
 starter-rig agent skills that exercise the UI are product content for user rigs, not
