@@ -121,7 +121,7 @@ export function renderDaemonTransportError(
         ? "The command's outcome is UNKNOWN — no usable response confirmed whether the write was applied."
         : "The command was not delivered.",
       action: e.writeOutcome === "unknown"
-        ? "Reconcile using the recovery ID before any retry. A lost connection does not prove the write failed."
+        ? "Check 'rig daemon status' on the affected host; if it is down, start it with 'rig daemon start'. Reconcile using the recovery ID before any retry. A lost connection does not prove the write failed."
         : "Confirm the daemon is reachable with 'rig daemon status'; if it is down, start it with 'rig up' or 'rig daemon start'.",
     };
   }

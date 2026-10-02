@@ -276,7 +276,7 @@ describe("queue unknown-write reconciliation", () => {
     }
   });
 
-  it("keeps genuine connection refusal nonzero and reconcilable without claiming a commit", async () => {
+  it.each([true, false])("keeps daemon-down create actionable and reconcilable (json=%s)", async (json) => {
     const server = createServer();
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -284,12 +284,17 @@ describe("queue unknown-write reconciliation", () => {
     if (!address || typeof address === "string") throw new Error("missing fixture address");
     await new Promise<void>((resolve) => server.close(() => resolve()));
     h.networkEndpoint(`http://127.0.0.1:${address.port}`);
-    const first = await h.run([...createArgs, "--no-nudge"]);
+    const first = await h.run([...createArgs, "--no-nudge"], json);
     expect(first.code).toBe(1);
     expect(h.rows()).toEqual([]);
-    expect(first.data.error.fact).toContain("Cannot connect");
-    expect(first.data.error.fact).toContain("--id");
-    expect(first.data.error.consequence).toContain("UNKNOWN");
+    const rendered = json ? JSON.stringify(first.data) : first.stderr.join("\n");
+    expect(rendered).toContain("Cannot connect");
+    expect(rendered).toContain("--id");
+    expect(rendered).toContain("UNKNOWN");
+    const action = json ? first.data.error.action : rendered;
+    expect(action).toContain("rig daemon status");
+    expect(action).toContain("rig daemon start");
+    expect(action).toContain("before any retry");
   });
 
   it.each(["handoff", "handoff-and-complete"])("%s preserves the source and exactly one successor through delayed wake and retry", async (verb) => {
