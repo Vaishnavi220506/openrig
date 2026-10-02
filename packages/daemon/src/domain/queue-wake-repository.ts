@@ -161,7 +161,7 @@ export class QueueWakeRepository {
   }
 
   /** A current attachment keeps a shared generated job alive until consumed.
-   *  Failed repeating deliveries retain ownership for the next scheduled retry. */
+   *  Failed or retained repeating deliveries keep ownership for the next retry. */
   findLiveQitemsByAttachedWatchdog(jobId: string): Array<{ qitemId: string; state: string }> {
     if (!this.available) return [];
     return this.db.prepare(
@@ -180,6 +180,7 @@ export class QueueWakeRepository {
                AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id
                AND (? = 0 OR f.delivery_status IS NULL OR (
                  f.delivery_status != 'failed' AND f.delivery_status NOT LIKE 'failed:%'
+                 AND f.delivery_status != 'retained'
                ))
           )`,
     ).all(jobId, this.isRepeatingTimer(jobId) ? 1 : 0).map((row) => {

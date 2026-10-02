@@ -610,7 +610,7 @@ describe("S03 R25 — a park records its wake on the append-only transition", ()
     },
   );
 
-  it("retries a failed shared repeating wake before consuming its attachment", async () => {
+  it.each(["failed", "retained"] as const)("retries a %s shared repeating wake before consuming its attachment", async status => {
     repo.attachWatchdogJobsRepository(jobs);
     const owner = "shared-owner@rig";
     const row = await item(owner);
@@ -624,14 +624,14 @@ describe("S03 R25 — a park records its wake on the append-only transition", ()
       blockedOn: "external:third", transitionNote: "new timer owner", wakeAfterSeconds: 60, wakeMaxSeconds: 240 });
     const sharedJob = jobs.getByIdOrThrow(ref);
     const deliver = vi.fn()
-      .mockResolvedValueOnce({ status: "failed", error: "owner temporarily unreachable" })
+      .mockResolvedValueOnce({ status, ...(status === "failed" ? { error: "owner temporarily unreachable" } : { outboxIds: ["held-wake"] }) })
       .mockResolvedValueOnce({ status: "ok" });
     const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: new WatchdogHistoryLog(db), eventBus: bus,
       resolveQueueWait: input => repo.evaluateWaitReminder(input),
       resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
       onWakeAttempt: ({ jobId, deliveryStatus }) => repo.recordWatchdogWakeAttempt(jobId, deliveryStatus), deliver });
-    expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).delivery?.status).toBe("failed");
-    expect(repo.getParkWakeStatus(attached.qitemId)).toMatchObject({ phase: "fired", deliveryStatus: "failed" });
+    expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).delivery?.status).toBe(status);
+    expect(repo.getParkWakeStatus(attached.qitemId)).toMatchObject({ phase: "fired", deliveryStatus: status });
     expect(jobs.getById(ref)).toMatchObject({ state: "active", intervalSeconds: sharedJob.intervalSeconds,
       specYaml: sharedJob.specYaml });
     expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).delivery?.status).toBe("ok");
