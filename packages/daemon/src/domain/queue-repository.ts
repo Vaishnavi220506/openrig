@@ -2667,7 +2667,9 @@ export class QueueRepository {
       }
       const oldWake = this.wakeRepo.getStatus(input.qitemId);
       const job = armQueueWait(this.db, jobsRepo, {
-        previousJobId: oldWake?.kind === "timer" ? oldWake.ref : undefined,
+        // Reusing a shared job would rewrite the attachment's schedule and packet.
+        previousJobId: oldWake?.kind === "timer" && this.wakeRepo.findQitemsByAttachedWatchdog(oldWake.ref).length === 0
+          ? oldWake.ref : undefined,
         qitemId: input.qitemId, blocker: effectiveBlockedOn,
         evidence: input.wakeProgressEvidence,
         initialSeconds: input.wakeAfterSeconds, maxSeconds: input.wakeMaxSeconds,
@@ -2871,6 +2873,9 @@ export class QueueRepository {
   private retireParkGeneratedTimer(qitemId: string, reason: string): void {
     const armed = this.wakeRepo.getStatus(qitemId);
     if (armed?.kind !== "timer" || !armed.live) return;
+    // An explicit --wake-watchdog attachment gives another continuation custody
+    // of this same job. The timer row's exit cannot cancel that attachment.
+    if (this.wakeRepo.findQitemsByAttachedWatchdog(armed.ref).length > 0) return;
     (this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db)).markTerminal(armed.ref, reason);
   }
 
@@ -3686,7 +3691,8 @@ export class QueueRepository {
 
   evaluateWaitReminder(input: { jobId: string }) {
     if (this.wakeRepo.findQitemsByAttachedWatchdog(input.jobId).length > 0
-      && this.wakeRepo.findQitemsByGeneratedTimer(input.jobId).every(row => row.state !== "blocked")) return null;
+      && this.wakeRepo.findQitemsByGeneratedTimer(input.jobId).every(row =>
+        row.state !== "blocked" || this.wakeRepo.getStatus(row.qitemId)?.ref !== input.jobId)) return null;
     const binding = this.wakeRepo.findBlockedQitemsByWatchdog(input.jobId).find(row => row.kind === "timer");
     const result = evaluateQueueWait(this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db), input.jobId, binding ? this.waitingView(binding.qitemId) : null);
     // Only an already-admitted send reads prose: healthy silence, receipts and

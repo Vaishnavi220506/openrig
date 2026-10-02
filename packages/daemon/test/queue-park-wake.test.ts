@@ -529,6 +529,81 @@ describe("S03 R25 — a park records its wake on the append-only transition", ()
     expect(terminalReason(ref)).toBe("park_ended:auto-unparked");
   });
 
+  it.each((["claim", "handoff", "handoff-and-complete", "cross-host", "complete", "auto-unpark", "re-park", "still-parked"] as const)
+    .flatMap(exit => [false, true].map(repeating => ({ exit, repeating }))))(
+    "keeps a shared watchdog deliverable after $exit (repeating=$repeating)",
+    async ({ exit, repeating }) => {
+      repo.attachWatchdogJobsRepository(jobs);
+      const owner = "shared-owner@rig";
+      const blocker = await item("gate@rig");
+      const row = await item(owner);
+      repo.update({ qitemId: row.qitemId, actorSession: owner, state: "blocked",
+        blockedOn: blocker.qitemId, transitionNote: "wait for the gate with a timer",
+        wakeAfterSeconds: 30, ...(repeating ? { wakeMaxSeconds: 120 } : {}) });
+      const ref = repo.getParkWakeStatus(row.qitemId)!.ref;
+      const attached = await item(owner);
+      repo.update({
+        qitemId: attached.qitemId, actorSession: owner, state: "blocked",
+        blockedOn: "external:vendor-window", transitionNote: "wait on the shared watchdog",
+        wakeWatchdogId: ref,
+      });
+      const sharedJob = jobs.getByIdOrThrow(ref);
+
+      if (exit === "claim") {
+        repo.claim({ qitemId: row.qitemId, destinationSession: owner });
+      } else if (exit === "handoff") {
+        await repo.handoff({ qitemId: row.qitemId, fromSession: owner, toSession: "next@rig", nudge: false });
+      } else if (exit === "handoff-and-complete") {
+        await repo.handoffAndComplete({ qitemId: row.qitemId, fromSession: owner, toSession: "next@rig", nudge: false });
+      } else if (exit === "cross-host") {
+        repo.closeCrossHostHandoffSource({ qitemId: row.qitemId, fromSession: owner, toSession: "next@rig",
+          closureTarget: "qitem-remote-1@otherhost", terminalState: "handed-off" });
+      } else if (exit === "complete") {
+        repo.update({ qitemId: row.qitemId, actorSession: owner, state: "done",
+          closureReason: "no-follow-on", transitionNote: "timer work completed" });
+      } else if (exit === "auto-unpark") {
+        repo.update({ qitemId: blocker.qitemId, actorSession: "gate@rig", state: "done",
+          closureReason: "no-follow-on", transitionNote: "gate completed" });
+      } else if (exit === "re-park") {
+        repo.update({ qitemId: row.qitemId, actorSession: owner, state: "blocked",
+          blockedOn: "external:new-window", transitionNote: "a different park owns a new timer",
+          wakeAfterSeconds: 60, ...(repeating ? { wakeMaxSeconds: 240 } : {}) });
+      }
+
+      if (exit === "re-park") expect(repo.getParkWakeStatus(row.qitemId)?.ref).not.toBe(ref);
+      else if (exit === "still-parked") expect(repo.getParkWakeStatus(row.qitemId)?.ref).toBe(ref);
+      else expect(repo.getById(row.qitemId)?.state).not.toBe("blocked");
+      expect(jobs.getById(ref)?.state).toBe("active");
+      expect(jobs.getById(ref)).toMatchObject({
+        specYaml: sharedJob.specYaml, intervalSeconds: sharedJob.intervalSeconds,
+        lastEvaluationAt: sharedJob.lastEvaluationAt,
+      });
+      expect(repo.getParkWakeStatus(attached.qitemId)).toMatchObject({ kind: "watchdog", live: true });
+
+      const deliveries: Array<{ targetSession: string; message: string }> = [];
+      const engine = new WatchdogPolicyEngine({
+        jobsRepo: jobs, historyLog: new WatchdogHistoryLog(db), eventBus: bus,
+        resolveQueueWait: input => repo.evaluateWaitReminder(input),
+        resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
+        onWakeAttempt: ({ jobId, deliveryStatus }) => repo.recordWatchdogWakeAttempt(jobId, deliveryStatus),
+        deliver: async request => { deliveries.push(request); return { status: "ok" }; },
+      });
+      expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).outcome.action).toBe("send");
+      expect(deliveries).toEqual([expect.objectContaining({ targetSession: owner })]);
+      expect(repo.getById(attached.qitemId)?.state).toBe("blocked");
+      expect(repo.getParkWakeStatus(attached.qitemId)).toMatchObject({ phase: "fired", deliveryStatus: "ok" });
+      if (exit === "still-parked") {
+        if (repeating) {
+          expect(jobs.getById(ref)).toMatchObject({ state: "active", intervalSeconds: 60 });
+          expect((await engine.evaluate(jobs.getByIdOrThrow(ref))).outcome).toMatchObject({ action: "skip", reason: "queue_wait_already_presented" });
+          expect(deliveries).toHaveLength(1);
+        } else {
+          expect(jobs.getById(ref)?.state).toBe("terminal");
+        }
+      }
+    },
+  );
+
   it("OPR.0.5.8.1 S1b — the handoff exit leaves an operator's ATTACHED watchdog alone", async () => {
     // The shared ownership predicate is used by every exit caller; this test
     // executes one real handoff route rather than claiming a six-route matrix.
