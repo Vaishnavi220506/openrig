@@ -36,7 +36,11 @@ migrations re-confirmed at HEAD `packages/daemon/src/db/migrations/`):
   `interrupt`, `archived_at`. Items immutable after emit (only `archived_at`
   may be set).
 - **`queue_items`** (`024_queue_items.ts`) — L3 owned-work queue. `qitem_id`
-  is TEXT PK preserving the POC `qitem-YYYYMMDDHHMMSS-<hex>` shape. State
+  is TEXT PK preserving the POC `qitem-YYYYMMDDHHMMSS-<hex>` shape. The CLI
+  generates its create ID before sending, using a UTC timestamp and 64 random
+  bits (16 lowercase hex characters), and prints it to stderr as a request
+  identity, not proof of persistence. Reuse that ID with `--id` for the same
+  create after an unknown outcome; explicit IDs remain supported. State
   enum (8 values): `pending | in-progress | done | blocked | failed |
   denied | canceled | handed-off`. Carries `closure_reason`,
   `closure_target`, `closure_required_at`, `chain_of_record` (JSON),

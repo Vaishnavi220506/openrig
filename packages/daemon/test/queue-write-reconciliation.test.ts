@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { Hono } from "hono";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -25,9 +27,11 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-// Actual CLI/client deadline, Hono routes and SQLite transactions; only HTTP
-// transport and the pane wake are substituted. No sockets, native seats or disk DB.
+// Actual CLI/client deadline, Hono routes and SQLite transactions. Most controls
+// substitute HTTP; pre-header-loss controls use private loopback sockets. Pane
+// wake is substituted throughout; no native seats or disk DB.
 function harness() {
+  let endpoint: string | undefined;
   const db = createDb();
   migrate(db, ALL_MIGRATIONS);
   const bus = new EventBus(db);
@@ -70,23 +74,24 @@ function harness() {
       server.then(resolve, reject).finally(() => init?.signal?.removeEventListener("abort", aborted));
     });
   };
-  async function run(args: string[]) {
+  async function run(args: string[], json = true) {
     stdout.length = 0;
     stderr.length = 0;
     process.exitCode = undefined;
     const program = new Command();
     program.addCommand(queueCommand({
       lifecycleDeps: {} as never,
-      clientFactory: () => new DaemonClient("http://queue.invalid", { fetchImpl, timeoutMs: 40 }),
+      clientFactory: () => new DaemonClient(endpoint ?? "http://queue.invalid", endpoint ? { timeoutMs: 1500 } : { fetchImpl, timeoutMs: 40 }),
     }));
-    const code = await runProgram(program, ["node", "rig", "queue", ...args, "--json"], {
+    const code = await runProgram(program, ["node", "rig", "queue", ...args, ...(json ? ["--json"] : [])], {
       out: (line) => stdout.push(line), err: (line) => stderr.push(line), exit: () => {},
     });
-    expect(stdout).toHaveLength(1); // no pre-request receipt on machine stdout
-    return { code: process.exitCode ?? code, data: JSON.parse(stdout[0]!), stderr: [...stderr] };
+    if (json) expect(stdout).toHaveLength(1); // no pre-request receipt on machine stdout
+    return { code: process.exitCode ?? code, data: json ? JSON.parse(stdout[0]!) : undefined, stdout: [...stdout], stderr: [...stderr] };
   }
   return {
-    db, repo, requests, pending, run,
+    db, repo, requests, pending, run, app,
+    networkEndpoint: (url: string) => { endpoint = url; },
     delayNext: (gate: Promise<void>) => { beforeNextRequest = gate; },
     corruptNext: () => { corruptNextResponse = true; },
     rows: () => db.prepare("SELECT qitem_id, state, body, handed_off_from FROM queue_items ORDER BY rowid").all() as Array<{ qitem_id: string; state: string; body: string; handed_off_from: string | null }>,
@@ -172,6 +177,64 @@ describe("queue unknown-write reconciliation", () => {
     expect(second.code).toBe(0);
     expect(first.data.qitemId).not.toBe(second.data.qitemId);
     expect(h.rows()).toHaveLength(2);
+  });
+
+  // Review-R2's #410 pre-header-loss discriminator, retained as a real HTTP
+  // control: the server commits the row, then closes without response headers.
+  it.each([true, false])("reports unknown after committed create loses headers (json=%s)", async (json) => {
+    let received = 0;
+    const server = createServer(async (req, res) => {
+      received++;
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const response = await h.app.request(`http://queue.invalid${req.url}`, {
+        method: req.method, headers: req.headers as Record<string, string>, body,
+      });
+      if (received === 1) res.destroy();
+      else { res.writeHead(response.status, { "content-type": "application/json" }); res.end(await response.text()); }
+    });
+    try {
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("missing fixture address");
+      h.networkEndpoint(`http://127.0.0.1:${address.port}`);
+      const first = await h.run([...createArgs, "--no-nudge"], json);
+      expect(first.code).toBe(1);
+      expect(received).toBe(1);
+      expect(h.rows()).toHaveLength(1);
+      const id = h.rows()[0]!.qitem_id;
+      expect(h.rows()[0]!.body).toBe(BODY);
+      const rendered = json ? JSON.stringify(first.data) : first.stderr.join("\n");
+      expect(rendered).toContain(id);
+      expect(rendered).toContain("--id");
+      const retry = await h.run([...createArgs, "--id", id, "--no-nudge"]);
+      expect(retry.code).toBe(0);
+      expect(received).toBe(2);
+      expect(h.rows()).toHaveLength(1);
+      expect(rendered).not.toContain("The command was not delivered.");
+      if (json) expect(first.data.error.consequence).toContain("UNKNOWN");
+      else expect(first.stdout).toEqual([]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("keeps genuine connection refusal nonzero and reconcilable without claiming a commit", async () => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing fixture address");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    h.networkEndpoint(`http://127.0.0.1:${address.port}`);
+    const first = await h.run([...createArgs, "--no-nudge"]);
+    expect(first.code).toBe(1);
+    expect(h.rows()).toEqual([]);
+    expect(first.data.error.fact).toContain("Cannot connect");
+    expect(first.data.error.fact).toContain("--id");
+    expect(first.data.error.consequence).toContain("UNKNOWN");
   });
 
   it.each(["handoff", "handoff-and-complete"])("%s preserves the source and exactly one successor through delayed wake and retry", async (verb) => {
