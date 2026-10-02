@@ -160,7 +160,8 @@ export class QueueWakeRepository {
     });
   }
 
-  /** Only a current, unfired attachment keeps a shared generated job alive. */
+  /** A current attachment keeps a shared generated job alive until consumed.
+   *  Failed repeating deliveries retain ownership for the next scheduled retry. */
   findLiveQitemsByAttachedWatchdog(jobId: string): Array<{ qitemId: string; state: string }> {
     if (!this.available) return [];
     return this.db.prepare(
@@ -177,8 +178,11 @@ export class QueueWakeRepository {
             SELECT 1 FROM queue_transition_wakes f
              WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
                AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id
+               AND (? = 0 OR f.delivery_status IS NULL OR (
+                 f.delivery_status != 'failed' AND f.delivery_status NOT LIKE 'failed:%'
+               ))
           )`,
-    ).all(jobId).map((row) => {
+    ).all(jobId, this.isRepeatingTimer(jobId) ? 1 : 0).map((row) => {
       const r = row as { qitem_id: string; state: string };
       return { qitemId: r.qitem_id, state: r.state };
     });
