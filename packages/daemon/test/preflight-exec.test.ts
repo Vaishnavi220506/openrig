@@ -39,9 +39,9 @@ function probe(mode: string, runtime = "pi") {
 }
 
 describe("runtime version preflight cwd", () => {
-  it.each(["pi", "omp", "codex", "claude"])("binds only %s --version to a stable root", (runtime) => {
+  it.each(["pi", "omp", "codex", "claude"])("preserves a healthy cwd for %s --version", (runtime) => {
     const cwd = runtimeVersionProbeCwd(`${runtime} --version`);
-    expect(cwd).toBe(path.parse(process.execPath).root);
+    expect(cwd).toBe(process.cwd());
     expect(fs.statSync(cwd!).isDirectory()).toBe(true);
     expect(runtimeVersionProbeCwd(`${runtime} --help`)).toBeUndefined();
   });
@@ -59,24 +59,47 @@ describe("runtime version preflight cwd", () => {
     expect(result.status).toBe(200);
     expect(result.core.ready).toBe(true);
     expect(result.route.ready).toBe(true);
+    expect(result.legacy.ready).toBe(true);
+    expect(result.bootstrap).toMatchObject({ status: 200, result: { status: "planned", errors: [] } });
     expect(fs.realpathSync(result.nonVersion)).toBe(fs.realpathSync(result.work));
     expect(result.generic).toBe(result.nonVersion);
   });
 
-  it.skipIf(process.platform === "win32").each(["pi", "omp"])("survives a deleted daemon cwd for %s through both paths", (runtime) => {
+  it.skipIf(process.platform === "win32").each(["pi", "omp"])("survives a deleted daemon cwd for %s through all preflight paths", (runtime) => {
     const result = probe("deleted", runtime);
     expect(result.core).toMatchObject({ ready: true, errors: [] });
     expect(result.route).toMatchObject({ ready: true, errors: [] });
+    expect(result.legacy).toMatchObject({ ready: true, errors: [] });
+    expect(result.bootstrap).toMatchObject({ status: 200, result: { status: "planned", errors: [] } });
+  });
+
+  it.skipIf(process.platform === "win32").each(["pi", "omp"])("keeps relative PATH lookup in a healthy cwd for %s", (runtime) => {
+    const result = probe("relative", runtime);
+    expect(fs.realpathSync(result.generic)).toBe(fs.realpathSync(result.work));
+    expect(result.core).toMatchObject({ ready: true, errors: [] });
+    expect(result.route).toMatchObject({ ready: true, errors: [] });
+    expect(result.legacy).toMatchObject({ ready: true, errors: [] });
+    expect(result.bootstrap).toMatchObject({ status: 200, result: { status: "planned", errors: [] } });
+  });
+
+  it.skipIf(process.platform === "win32").each(["pi", "omp"])("does not trust a cached cwd after deletion for %s", (runtime) => {
+    const result = probe("deleted-cached", runtime);
+    expect(result.core).toMatchObject({ ready: true, errors: [] });
+    expect(result.route).toMatchObject({ ready: true, errors: [] });
+    expect(result.legacy).toMatchObject({ ready: true, errors: [] });
+    expect(result.bootstrap).toMatchObject({ status: 200, result: { status: "planned", errors: [] } });
   });
 
   it.skipIf(process.platform === "win32")("still refuses a genuinely absent executable, with bounded detail", () => {
     const result = probe("missing");
-    for (const value of [result.core, result.route]) {
+    for (const value of [result.core, result.route, result.legacy]) {
       expect(value.ready).toBe(false);
       expect(value.errors).toHaveLength(1);
       expect(value.errors[0]).toContain("exit status 127");
       expect(value.errors[0]).toContain("executable not found on PATH");
     }
+    expect(result.bootstrap).toMatchObject({ status: 409, result: { status: "failed" } });
+    expect(result.bootstrap.result.errors.join("\n")).toContain("executable not found on PATH");
   });
 
   it("distinguishes cwd lookup failure without echoing arbitrary process output", async () => {

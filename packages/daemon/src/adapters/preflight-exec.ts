@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { statSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ExecFn } from "./tmux.js";
@@ -6,13 +7,17 @@ import { execCommand } from "./tmux-exec.js";
 
 const execAsync = promisify(exec);
 
-/** Version checks do not belong to a project. The executable's filesystem root
- * survives deletion of the directory from which the daemon was started. Keep
- * profile/config probes and all other commands in their existing context. */
+/** Preserve healthy relative PATH lookup; use the executable's filesystem root
+ * only when the daemon's inherited cwd is unavailable. Profile/config probes
+ * and all other commands keep their existing context. */
 export function runtimeVersionProbeCwd(cmd: string): string | undefined {
-  return /^(pi|omp|codex|claude) --version$/.test(cmd)
-    ? path.parse(process.execPath).root
-    : undefined;
+  if (!/^(pi|omp|codex|claude) --version$/.test(cmd)) return undefined;
+  try {
+    const cwd = process.cwd();
+    // Node can cache cwd even after the directory has been removed.
+    if (statSync(cwd).isDirectory()) return cwd;
+  } catch { /* Unavailable cwd: a version probe can run from the root. */ }
+  return path.parse(process.execPath).root;
 }
 
 /** Production preflight only; callers still prefer an explicitly injected exec. */
