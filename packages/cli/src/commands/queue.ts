@@ -621,6 +621,10 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
           return;
         }
+        const createWarning = res.data?.createWarning as { code?: unknown; message?: unknown } | undefined;
+        if (res.status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
+          console.error(`Warning: ${createWarning.message}`);
+        }
         if (opts.verify && res.status < 400) {
           const created = res.data;
           const qitemId = typeof created.qitemId === "string" ? created.qitemId : null;

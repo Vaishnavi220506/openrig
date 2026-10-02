@@ -1291,6 +1291,17 @@ destination host's daemon URL and use
 `OPENRIG_URL='<destination-daemon-url>' rig queue show <id> --full --json`.
 `--json` keeps stdout as one JSON document; the pre-send receipt is on stderr.
 
+Reusing an ID with the same source and destination returns the existing row,
+without creating new work or delivering it again. If the supplied body differs,
+the response includes `createWarning.code: "qitem_body_not_saved"` and the CLI
+warns on stderr that the changed body was **not saved**. The original row is
+unchanged; HTTP success and the CLI success exit remain compatible with existing
+retry callers. With `--verify`, `persisted` and `delivery` describe that returned
+original row, not the unsaved body. This warning requires a daemon containing
+this change; an older daemon can return the original row without it. Other
+changed options are not compared by this body warning; retry with the same full
+payload. A different source or destination remains an ID-reuse conflict.
+
 Subcommands:
 - `create --source <session> --destination <session> (--body <text> | --body-file <path> | --body-context <ref>) [--mission <id>] [--slice <id>] [--priority <p>] [--tier <t>] [--tags <csv>] [--target-repo <name>] [--host <id>] [--no-nudge] [--expires-at <iso>] [--id <qitemId>] [--json]` — `--body-context <ref>` resolves a complete context pack, snapshots that content into the qitem body, and adds a `body-context:<ref>` provenance tag; it is mutually exclusive with `--body` / `--body-file`, and missing members abort before qitem creation. v0.3.2 slice-21 FR-4 adds `--body-file <path>` (use `-` for stdin) which kills the backtick-shell-corruption class for multiline bodies, and first-class `--mission <id>` / `--slice <id>` flags that translate to `mission:<id>` / `slice:<id>` tags (compose with `--tags`). v0.4.6 (OPR.0.4.6.MH3) adds `--host <id>` / the `agent@rig@host` destination form — see § Cross-host queue routing below.
 - `claim <qitemId> --destination <session> [--json]` — pending → in-progress; computes closure_required_at from tier

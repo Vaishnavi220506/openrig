@@ -58,7 +58,7 @@ function harness() {
     beforeNextRequest = undefined;
     const corrupt = corruptNextResponse;
     corruptNextResponse = false;
-    requests.push({ path: new URL(url).pathname, body: JSON.parse(String(init?.body)), stderr: [...stderr] });
+    requests.push({ path: new URL(url).pathname, body: init?.body ? JSON.parse(String(init.body)) : {}, stderr: [...stderr] });
     const server = (async () => {
       if (gate) await gate;
       // A client abort does not undo an accepted server request. Deliberately
@@ -81,6 +81,7 @@ function harness() {
     const program = new Command();
     program.addCommand(queueCommand({
       lifecycleDeps: {} as never,
+      deliveryVerify: { timeoutMs: 0 },
       clientFactory: () => new DaemonClient(endpoint ?? "http://queue.invalid", endpoint ? { timeoutMs: 1500 } : { fetchImpl, timeoutMs: 40 }),
     }));
     const code = await runProgram(program, ["node", "rig", "queue", ...args, ...(json ? ["--json"] : [])], {
@@ -177,6 +178,60 @@ describe("queue unknown-write reconciliation", () => {
     expect(second.code).toBe(0);
     expect(first.data.qitemId).not.toBe(second.data.qitemId);
     expect(h.rows()).toHaveLength(2);
+  });
+
+  it("keeps same-ID/same-body retries successful and unchanged, without another event or wake", async () => {
+    const send = vi.fn(async () => ({ ok: true, verified: true }));
+    h.repo.attachTransport({ send });
+    const first = await h.run([...createArgs, "--id", "qitem-same-body"]);
+    const transitions = h.db.prepare("SELECT * FROM queue_transitions").all();
+    const events = h.db.prepare("SELECT * FROM events").all();
+    const retry = await h.run([...createArgs, "--id", "qitem-same-body"]);
+    expect(retry.code).toBe(0);
+    expect(retry.data).toEqual(first.data);
+    expect(retry.data.createWarning).toBeUndefined();
+    expect(retry.stderr.join("\n")).not.toContain("not saved");
+    expect(h.rows()).toHaveLength(1);
+    expect(h.db.prepare("SELECT * FROM queue_transitions").all()).toEqual(transitions);
+    expect(h.db.prepare("SELECT * FROM events").all()).toEqual(events);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { json: true, verify: false }, { json: false, verify: false },
+    { json: true, verify: true }, { json: false, verify: true },
+  ])("warns that a changed body was not saved (json=$json, verify=$verify)", async ({ json, verify }) => {
+    const send = vi.fn(async () => ({ ok: true, verified: true }));
+    h.repo.attachTransport({ send });
+    const first = await h.run([...createArgs, "--id", "qitem-body-conflict"]);
+    const before = {
+      rows: h.db.prepare("SELECT * FROM queue_items").all(),
+      transitions: h.db.prepare("SELECT * FROM queue_transitions").all(),
+      events: h.db.prepare("SELECT * FROM events").all(),
+    };
+    // Difference is beyond the preview, including a final newline. Compare the
+    // full body, not a truncated or whitespace-normalized rendering.
+    const retry = await h.run([
+      "create", "--destination", "reader@fixture", "--body", BODY + "changed tail\n",
+      "--summary", "Retain assignment", "--id", "qitem-body-conflict", ...(verify ? ["--verify"] : []),
+    ], json);
+    expect(retry.code).toBe(0); // additive warning; existing retry callers keep success
+    const returned = json ? retry.data : JSON.parse(retry.stdout.join("\n"));
+    expect(returned.qitemId).toBe(first.data.qitemId);
+    expect(returned.body).toBe(BODY);
+    expect(returned.createWarning?.code).toBe("qitem_body_not_saved");
+    expect(returned.createWarning?.message).toContain("not saved");
+    expect(retry.stderr.join("\n")).toContain("not saved");
+    if (verify) {
+      // These fields refer to the returned original row, never to the rejected body.
+      expect(returned.persisted).toBe(true);
+      expect(returned.delivery.outcome).toBe("still-pending");
+    }
+    expect(h.db.prepare("SELECT * FROM queue_items").all()).toEqual(before.rows);
+    expect(h.db.prepare("SELECT * FROM queue_transitions").all()).toEqual(before.transitions);
+    expect(h.db.prepare("SELECT * FROM events").all()).toEqual(before.events);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(h.repo.getById(first.data.qitemId)).not.toHaveProperty("createWarning");
   });
 
   // Review-R2's #410 pre-header-loss discriminator, retained as a real HTTP
