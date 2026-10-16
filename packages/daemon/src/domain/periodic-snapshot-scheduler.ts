@@ -93,6 +93,7 @@ export class PeriodicSnapshotScheduler {
           // do not wrap refresh + capture in a single try/catch).
           if (this.deps.resumeMetadataRefresher && this.deps.sessionRegistry) {
             const sessions = this.deps.sessionRegistry.getLatestLiveSessions(rigId);
+            const hasEarlierUsableSnapshot = this.deps.snapshotRepo.findLatestRestoreUsable(rigId) !== null;
             try {
               // fillNullOnly: a routine snapshot refresh fills null tokens but NEVER
               // clears a present one (rev1-r2 fix — keep stale-present for FR-6).
@@ -105,7 +106,7 @@ export class PeriodicSnapshotScheduler {
               .filter((session) => session.status === "running").map((session) => session.sessionId));
             // Teardown stops seats one at a time; do not publish a partial
             // occupant set if any refreshed running seat stopped or was replaced.
-            if (sessions.some((session) => session.status === "running" && !runningIds.has(session.sessionId))) continue;
+            if (hasEarlierUsableSnapshot && sessions.some((session) => session.status === "running" && !runningIds.has(session.sessionId))) continue;
           }
           // Refresh yields to teardown/archive. Recheck immediately before the
           // synchronous capture so a stopped rig cannot replace its pre-down

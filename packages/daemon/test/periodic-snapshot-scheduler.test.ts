@@ -225,6 +225,7 @@ describe("PeriodicSnapshotScheduler", () => {
   it("skips a replacement during refresh and captures the next stable tick", async () => {
     const rigId = seedRunningRig("r-replaced");
     const original = sessionRegistry.getSessionsForRig(rigId)[0]!;
+    snapshotCapture.captureSnapshot(rigId, "auto-pre-down");
     db.prepare("UPDATE sessions SET created_at = '2026-01-01 00:00:00' WHERE id = ?").run(original.id);
     const refresh = vi.fn(async () => {}).mockImplementationOnce(async () => {
       sessionRegistry.updateStatus(original.id, "superseded");
@@ -242,6 +243,32 @@ describe("PeriodicSnapshotScheduler", () => {
     expect(snapshots).toHaveLength(1);
     expect(snapshots[0]!.data.activeOccupantsByNode?.[original.nodeId]).toEqual({
       kind: "resolved", sessionId: sessionRegistry.getLatestLiveSessions(rigId)[0]!.sessionId,
+    });
+  });
+
+  it("captures a replacement during refresh when no earlier usable snapshot exists", async () => {
+    const rigId = seedRunningRig("r-replaced-without-snapshot");
+    const original = sessionRegistry.getSessionsForRig(rigId)[0]!;
+    db.prepare("UPDATE sessions SET created_at = '2026-01-01 00:00:00' WHERE id = ?").run(original.id);
+    let replacementId: string | undefined;
+    const refresh = vi.fn(async () => {
+      sessionRegistry.updateStatus(original.id, "superseded");
+      const replacement = sessionRegistry.registerSession(original.nodeId, original.sessionName);
+      sessionRegistry.updateStatus(replacement.id, "running");
+      replacementId = replacement.id;
+    });
+    const periodic = new PeriodicSnapshotScheduler({
+      db, snapshotCapture, snapshotRepo, sessionRegistry,
+      resumeMetadataRefresher: { refresh } as unknown as Refresher,
+    });
+
+    await periodic.tick();
+
+    const snapshots = snapshotRepo.listSnapshots(rigId, { kind: "auto-periodic" });
+    expect(snapshots).toHaveLength(1);
+    expect(replacementId).toBeDefined();
+    expect(snapshots[0]!.data.activeOccupantsByNode?.[original.nodeId]).toEqual({
+      kind: "resolved", sessionId: replacementId,
     });
   });
 
