@@ -222,6 +222,77 @@ describe("PeriodicSnapshotScheduler", () => {
     expect(snapshotRepo.listSnapshots(rigId, { kind: "auto-periodic" })).toHaveLength(0);
   });
 
+  it("preserves a pre-down snapshot created during a partial teardown refresh", async () => {
+    const rigId = seedRunningRig("r-partial-down-first-snapshot");
+    const node = rigRepo.addNode(rigId, "sibling", { role: "worker" });
+    const sibling = sessionRegistry.registerSession(node.id, "sibling@r-partial-down-first-snapshot");
+    sessionRegistry.updateStatus(sibling.id, "running");
+
+    let releaseRefresh!: () => void;
+    const refreshPending = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    let secondKillStarted!: () => void;
+    const secondKillEntered = new Promise<void>((resolve) => { secondKillStarted = resolve; });
+    let releaseSecondKill!: () => void;
+    const secondKillPending = new Promise<void>((resolve) => { releaseSecondKill = resolve; });
+    let killCount = 0;
+    const killSession = vi.fn(async () => {
+      killCount++;
+      if (killCount === 2) {
+        secondKillStarted();
+        await secondKillPending;
+      }
+      return { ok: true };
+    });
+    let refreshStarted!: () => void;
+    const refreshEntered = new Promise<void>((resolve) => { refreshStarted = resolve; });
+    const periodic = new PeriodicSnapshotScheduler({
+      db, snapshotCapture, snapshotRepo, sessionRegistry,
+      resumeMetadataRefresher: {
+        refresh: vi.fn(async () => {
+          refreshStarted();
+          await refreshPending;
+        }),
+      } as unknown as Refresher,
+    });
+    const tick = periodic.tick();
+    await refreshEntered;
+
+    const teardown = new RigTeardownOrchestrator({
+      db, rigRepo, sessionRegistry, eventBus, snapshotCapture,
+      tmuxAdapter: { killSession } as unknown as TmuxAdapter,
+    });
+    const down = teardown.teardown(rigId);
+    await secondKillEntered;
+
+    // Teardown has captured the complete pre-down source and stopped only the
+    // first seat, leaving a running sibling while the refresh is pending.
+    releaseRefresh();
+    await tick;
+    releaseSecondKill();
+    const result = await down;
+
+    expect(result.sessionsKilled).toBe(2);
+    expect(result.snapshotId).not.toBeNull();
+    expect(snapshotRepo.listSnapshots(rigId, { kind: "auto-periodic" })).toHaveLength(0);
+    expect(snapshotRepo.findLatestRestoreUsable(rigId)?.id).toBe(result.snapshotId);
+  });
+
+  it("captures when the earlier restore-source lookup fails", async () => {
+    const rigId = seedRunningRig("r-restore-lookup-fails");
+    const lookup = vi.spyOn(snapshotRepo, "findLatestRestoreUsable")
+      .mockImplementation(() => { throw new Error("lookup failed"); });
+    const periodic = new PeriodicSnapshotScheduler({
+      db, snapshotCapture, snapshotRepo, sessionRegistry,
+      resumeMetadataRefresher: { refresh: vi.fn(async () => {}) } as unknown as Refresher,
+    });
+
+    await periodic.tick();
+
+    expect(lookup).toHaveBeenCalledWith(rigId);
+    expect(snapshotRepo.listSnapshots(rigId, { kind: "auto-periodic" })).toHaveLength(1);
+    lookup.mockRestore();
+  });
+
   it("skips a replacement during refresh and captures the next stable tick", async () => {
     const rigId = seedRunningRig("r-replaced");
     const original = sessionRegistry.getSessionsForRig(rigId)[0]!;

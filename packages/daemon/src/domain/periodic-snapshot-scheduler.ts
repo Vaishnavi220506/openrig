@@ -93,7 +93,6 @@ export class PeriodicSnapshotScheduler {
           // do not wrap refresh + capture in a single try/catch).
           if (this.deps.resumeMetadataRefresher && this.deps.sessionRegistry) {
             const sessions = this.deps.sessionRegistry.getLatestLiveSessions(rigId);
-            const hasEarlierUsableSnapshot = this.deps.snapshotRepo.findLatestRestoreUsable(rigId) !== null;
             try {
               // fillNullOnly: a routine snapshot refresh fills null tokens but NEVER
               // clears a present one (rev1-r2 fix — keep stale-present for FR-6).
@@ -106,6 +105,13 @@ export class PeriodicSnapshotScheduler {
               .filter((session) => session.status === "running").map((session) => session.sessionId));
             // Teardown stops seats one at a time; do not publish a partial
             // occupant set if any refreshed running seat stopped or was replaced.
+            // Read after refresh: teardown may have written the pre-down source
+            // while refresh was awaiting. A lookup failure is best-effort and
+            // must not suppress the periodic capture.
+            let hasEarlierUsableSnapshot = false;
+            try {
+              hasEarlierUsableSnapshot = this.deps.snapshotRepo.findLatestRestoreUsable(rigId) !== null;
+            } catch { /* treat an unavailable lookup as no earlier snapshot */ }
             if (hasEarlierUsableSnapshot && sessions.some((session) => session.status === "running" && !runningIds.has(session.sessionId))) continue;
           }
           // Refresh yields to teardown/archive. Recheck immediately before the
