@@ -390,6 +390,7 @@ interface ParsedPsControls {
   limit: number | null;
   fields: string[] | null;
   useEnvelope: boolean;
+  nodeOnlyFilterNotice?: string;
 }
 
 function parsePsControls(opts: PsCliOptions): ParsedPsControls | { error: string } {
@@ -428,19 +429,14 @@ function parsePsControls(opts: PsCliOptions): ParsedPsControls | { error: string
   }
 
   // PL-012: context usage is sampled per node, not on the rig summary.
-  // Reject the rig-tier form instead of accepting it and silently returning
-  // every rig as if the filter had matched.
-  if (
-    parsedFilter &&
+  // Preserve the rig-tier output contract, but make the unsupported scope
+  // visible instead of silently implying that the filter was applied.
+  const nodeOnlyFilterNotice = parsedFilter &&
     (parsedFilter.key === "contextUsage.percent" || parsedFilter.key === "contextUsage.state") &&
     !opts.nodes
-  ) {
-    return {
-      error:
-        `--filter ${parsedFilter.key} is a per-node context signal available only at the node tier. ` +
-        `Add --nodes (rig-summary rows carry no context usage) — nothing was filtered.`,
-    };
-  }
+    ? `Notice: --filter ${parsedFilter.key} is node-level and was not applied at the rig tier; use --nodes to apply it.`
+    : undefined;
+  const appliedFilter = nodeOnlyFilterNotice ? null : parsedFilter;
 
   const limit = opts.limit !== undefined ? Number(opts.limit) : null;
   if (limit !== null && (!Number.isInteger(limit) || limit < 0)) {
@@ -457,10 +453,11 @@ function parsePsControls(opts: PsCliOptions): ParsedPsControls | { error: string
   }
 
   return {
-    parsedFilter,
+    parsedFilter: appliedFilter,
     limit,
     fields,
-    useEnvelope: parsedFilter !== null || limit !== null || fields !== null || opts.summary === true,
+    useEnvelope: appliedFilter !== null || limit !== null || fields !== null || opts.summary === true,
+    nodeOnlyFilterNotice,
   };
 }
 
@@ -474,6 +471,9 @@ function applyRigFilter(entries: PsEntry[], filter: ParsedFilter): PsEntry[] {
     // level it has no meaning, so the filter passes everything through and
     // the user gets all rigs (the operator can `--nodes` to scope it).
     if (filter.key === "agentActivity.state") return true;
+    // PL-012: contextUsage.* is node-level only. The caller emits a notice
+    // at the rig tier, while retaining the existing output for compatibility.
+    if (filter.key === "contextUsage.percent" || filter.key === "contextUsage.state") return true;
     return true;
   });
 }
@@ -941,7 +941,8 @@ Exit codes:
         process.exitCode = 1;
         return;
       }
-      const { parsedFilter, limit, fields, useEnvelope } = controls;
+      const { parsedFilter, limit, fields, useEnvelope, nodeOnlyFilterNotice } = controls;
+      if (nodeOnlyFilterNotice) console.error(nodeOnlyFilterNotice);
 
       if (opts.allHosts || opts.hosts) {
         // AggregatedPayload is the closed fan-out contract (items + hosts).

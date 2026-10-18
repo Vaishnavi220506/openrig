@@ -99,7 +99,7 @@ describe("PL-012 ps --filter contextUsage.* + CTX field", () => {
       if (m && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(nodesByRig[decodeURIComponent(m[1]!)] ?? []));
-      } else if (req.url === "/api/ps" && req.method === "GET") {
+      } else if ((req.url === "/api/ps" || req.url === "/api/ps?includeArchived=true") && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify([{ rigId: "rig-1", name: "demo", nodeCount: 4, runningCount: 4, status: "running", uptime: "1h", latestSnapshot: null }]));
       } else {
@@ -184,24 +184,35 @@ describe("PL-012 ps --filter contextUsage.* + CTX field", () => {
     expect(entries.map((e: { canonicalSessionName: string }) => e.canonicalSessionName)).toEqual(["demo-delta"]);
   });
 
-  it("rejects contextUsage.percent filters at the rig tier instead of silently returning every rig", async () => {
-    const { logs, errLogs, exitCode } = await captureLogs(async () => {
-      await makeCmd().parseAsync(["node", "rig", "ps", "--json", "--filter", "contextUsage.percent>=80"]);
+  it.each([
+    ["contextUsage.percent>=80", "contextUsage.percent"],
+    ["contextUsage.state=critical", "contextUsage.state"],
+  ] as const)("keeps rig-tier output for %s and warns that it was not applied", async (filter, key) => {
+    const unfilteredText = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "ps"]);
     });
-    expect(exitCode).toBe(1);
-    expect(logs).toEqual([]);
-    expect(errLogs.join("\n")).toContain("--nodes");
-    expect(errLogs.join("\n")).toContain("node tier");
-    expect(errLogs.join("\n")).toContain("nothing was filtered");
-  });
+    const filteredText = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "ps", "--filter", filter]);
+    });
+    expect(filteredText.exitCode).toBeUndefined();
+    expect(filteredText.logs).toEqual(unfilteredText.logs);
+    expect(filteredText.errLogs).toHaveLength(1);
+    expect(filteredText.errLogs[0]).toContain(key);
+    expect(filteredText.errLogs[0]).toContain("was not applied");
+    expect(filteredText.errLogs[0]).toContain("--nodes");
 
-  it("rejects contextUsage.state filters at the rig tier", async () => {
-    const { logs, errLogs, exitCode } = await captureLogs(async () => {
-      await makeCmd().parseAsync(["node", "rig", "ps", "--json", "--filter", "contextUsage.state=critical"]);
+    const unfilteredJson = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "ps", "--json"]);
     });
-    expect(exitCode).toBe(1);
-    expect(logs).toEqual([]);
-    expect(errLogs.join("\n")).toContain("--nodes");
+    const filteredJson = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "ps", "--json", "--filter", filter]);
+    });
+    expect(filteredJson.exitCode).toBeUndefined();
+    expect(filteredJson.logs).toEqual(unfilteredJson.logs);
+    expect(filteredJson.errLogs).toHaveLength(1);
+    expect(filteredJson.errLogs[0]).toContain(key);
+    expect(filteredJson.errLogs[0]).toContain("was not applied");
+    expect(filteredJson.errLogs[0]).toContain("--nodes");
   });
 
   it("--filter contextUsage.percent>=invalid fails fast with three-part error and exit 1", async () => {
