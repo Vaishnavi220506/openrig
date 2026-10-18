@@ -427,6 +427,21 @@ function parsePsControls(opts: PsCliOptions): ParsedPsControls | { error: string
     parsedFilter = result;
   }
 
+  // PL-012: context usage is sampled per node, not on the rig summary.
+  // Reject the rig-tier form instead of accepting it and silently returning
+  // every rig as if the filter had matched.
+  if (
+    parsedFilter &&
+    (parsedFilter.key === "contextUsage.percent" || parsedFilter.key === "contextUsage.state") &&
+    !opts.nodes
+  ) {
+    return {
+      error:
+        `--filter ${parsedFilter.key} is a per-node context signal available only at the node tier. ` +
+        `Add --nodes (rig-summary rows carry no context usage) — nothing was filtered.`,
+    };
+  }
+
   const limit = opts.limit !== undefined ? Number(opts.limit) : null;
   if (limit !== null && (!Number.isInteger(limit) || limit < 0)) {
     return { error: `--limit must be a non-negative integer; got '${opts.limit}'` };
@@ -459,8 +474,6 @@ function applyRigFilter(entries: PsEntry[], filter: ParsedFilter): PsEntry[] {
     // level it has no meaning, so the filter passes everything through and
     // the user gets all rigs (the operator can `--nodes` to scope it).
     if (filter.key === "agentActivity.state") return true;
-    // PL-012: contextUsage.* filters are node-level only.
-    if (filter.key === "contextUsage.percent" || filter.key === "contextUsage.state") return true;
     return true;
   });
 }
@@ -835,7 +848,7 @@ per-node with hostId-stamped projected rows.
 (rig-summary rows carry no per-node activity). Cannot combine with --filter.
 
 --filter accepts: status, lifecycleState, name-prefix, name, agentActivity.state,
-contextUsage.percent, contextUsage.state. Other keys are rejected.
+contextUsage.percent, contextUsage.state (with --nodes). Other keys are rejected.
 
 --fields accepts (rig-level): rigId, name, rigName, nodeCount, runningCount,
 activeCount, hasWorkCount, attentionCount, status, lifecycleState, uptime,
@@ -866,7 +879,7 @@ Exit codes:
     .option("--limit <n>", "Limit number of entries (rigs or nodes)")
     .option("--fields <list>", "Comma-separated field list to project (JSON only)")
     .option("--summary", "Emit aggregate-only output (counts by status/lifecycle)")
-    .option("--filter <key=value>", "Filter entries; supported keys: status, lifecycleState, name-prefix, name, agentActivity.state")
+    .option("--filter <key=value>", "Filter entries; supported keys: status, lifecycleState, name-prefix, name, agentActivity.state, contextUsage.percent, contextUsage.state")
     .option("--active", "Shortcut for --filter agentActivity.state=running (PL-019)")
     .option("--running", "Alias for --active")
     .option("-A, --all-rigs", "Show all rigs (default is current rig only)")

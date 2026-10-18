@@ -184,6 +184,26 @@ describe("PL-012 ps --filter contextUsage.* + CTX field", () => {
     expect(entries.map((e: { canonicalSessionName: string }) => e.canonicalSessionName)).toEqual(["demo-delta"]);
   });
 
+  it("rejects contextUsage.percent filters at the rig tier instead of silently returning every rig", async () => {
+    const { logs, errLogs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "ps", "--json", "--filter", "contextUsage.percent>=80"]);
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toEqual([]);
+    expect(errLogs.join("\n")).toContain("--nodes");
+    expect(errLogs.join("\n")).toContain("node tier");
+    expect(errLogs.join("\n")).toContain("nothing was filtered");
+  });
+
+  it("rejects contextUsage.state filters at the rig tier", async () => {
+    const { logs, errLogs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "ps", "--json", "--filter", "contextUsage.state=critical"]);
+    });
+    expect(exitCode).toBe(1);
+    expect(logs).toEqual([]);
+    expect(errLogs.join("\n")).toContain("--nodes");
+  });
+
   it("--filter contextUsage.percent>=invalid fails fast with three-part error and exit 1", async () => {
     nodesByRig["rig-1"] = [nodeAt("alpha", 90)];
     const { errLogs, exitCode } = await captureLogs(async () => {
