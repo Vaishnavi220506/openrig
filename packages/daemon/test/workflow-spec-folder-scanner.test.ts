@@ -351,8 +351,8 @@ describe("scanWorkflowSpecFolder (slice 11)", () => {
 });
 
 // A spec file whose cached versions include one still pinned by running work, then a parse
-// error, then a repair (#503). Each write gets a later mtime and each scan caches one second after
-// it, so the scanner's mtime check sees changed and unchanged files as it would on disk.
+// error, then a repair (#503). Each write gets a later mtime while the cache uses the real clock,
+// so its timestamp comparisons also account for the filesystem's real ctime.
 describe("scanWorkflowSpecFolder: parse error and repair with several cached versions", () => {
   let db: Database.Database;
   let cache: WorkflowSpecCache;
@@ -378,7 +378,7 @@ describe("scanWorkflowSpecFolder: parse error and repair with several cached ver
   beforeEach(() => {
     db = createDb();
     migrate(db, [coreSchema, eventsSchema, workflowSpecsSchema, workflowSpecsDiagnosticSchema]);
-    cache = new WorkflowSpecCache(db, () => new Date((base + tick + 1) * 1000));
+    cache = new WorkflowSpecCache(db, () => new Date());
     folder = mkdtempSync(join(tmpdir(), "wf-folder-versions-"));
     file = join(folder, "wf.yaml");
     tick = 0;

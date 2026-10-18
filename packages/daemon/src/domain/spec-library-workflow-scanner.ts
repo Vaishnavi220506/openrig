@@ -377,13 +377,12 @@ function isUnderDir(childPath: string, parentDir: string): boolean {
 // disappear since the last scan get removed via removeBySourcePath
 // (OQ-4 decision; deletion + audit log).
 //
-// OQ-3 mtime check: a file is skipped when its mtime is <= the cache row's
-// cached_at and its content hash still matches. A file can be restored or
-// copied with an older mtime, so the timestamp alone cannot prove that the
-// cached content is current. Otherwise it's re-parsed via the cache (which
-// itself hashes the content and returns the prior row when the hash matches —
-// second layer of skip for content-stable files whose mtime advanced, e.g.,
-// touch).
+// OQ-3 timestamp check: a file is skipped when both its mtime/ctime are <=
+// the cache row's cached_at. A file can be restored or copied with an older
+// mtime, so ctime keeps the stat-only fast path honest. Files in the same
+// timestamp second still use the content hash, and other newer files are
+// re-parsed via the cache (which itself hashes the content and returns the
+// prior row when the hash matches).
 
 export interface ScanWorkflowSpecFolderOpts {
   /** SQLite handle (used for direct lookups). */
@@ -413,7 +412,7 @@ export interface ScanWorkflowSpecFolderResult {
   errors: number;
   /** Cache rows removed because their source_path no longer exists. */
   removed: number;
-  /** Files skipped via mtime check (unchanged since last scan). */
+  /** Files skipped via timestamp check (unchanged since last scan). */
   skipped: number;
 }
 
@@ -444,26 +443,25 @@ export function scanWorkflowSpecFolder(
   for (const entry of entries) {
     if (!isWorkflowYamlFile(entry)) continue;
     const filePath = path.join(opts.folder, entry);
-    let mtimeMs = 0;
+    let changeMs = 0;
     try {
       const stat = statSync(filePath);
       if (!stat.isFile()) continue;
-      mtimeMs = stat.mtimeMs;
+      changeMs = Math.max(stat.mtimeMs, stat.ctimeMs);
     } catch {
       continue;
     }
     seenPaths.add(filePath);
     result.scanned += 1;
 
-    // mtime check (OQ-3): if the cache has a row at this source_path
-    // whose cached_at is at or after the file's mtime, compare the
-    // content hash before skipping the re-parse. A restored or copied
-    // file can have an older mtime even though its content changed.
+    // Timestamp check (OQ-3): ctime protects the stat-only skip when a
+    // restored or copied file has an older mtime even though its content
+    // changed. Only the same timestamp second needs a content-hash check.
     //
     // Compare at second-resolution because some filesystems (HFS+, FAT)
-    // round mtime down to whole seconds while cached_at carries ms
-    // precision; without this floor a freshly-written file whose mtime
-    // is `T - 999ms` would always look "newer" than its cached_at at
+    // round mtime/ctime down to whole seconds while cached_at carries ms
+    // precision; without this floor a freshly-written file whose change
+    // time is `T - 999ms` would always look "newer" than its cached_at at
     // exactly `T` and never skip.
     // A path can hold several cached versions plus a diagnostic row (#503); the most
     // recently written row is the one that reflects the file's last scan.
@@ -473,21 +471,25 @@ export function scanWorkflowSpecFolder(
     if (cachedAt) {
       const cachedAtMs = Date.parse(cachedAt.cached_at);
       const cachedAtSec = Math.floor(cachedAtMs / 1000);
-      const mtimeSec = Math.floor(mtimeMs / 1000);
-      if (Number.isFinite(cachedAtMs) && cachedAtSec >= mtimeSec) {
-        // Consult the cache's existing content hash before treating the file
-        // as unchanged. This covers both same-second edits and edits whose
-        // mtime moved backwards. Hash the UTF-8 text exactly the way the
-        // cache hashes it on write (not the raw bytes): for files that are
-        // not clean UTF-8 the two digests differ and every scan would
-        // re-parse.
-        let unchanged = false;
-        try {
-          unchanged = createHash("sha256").update(readFileSync(filePath, "utf-8")).digest("hex") === cachedAt.source_hash;
-        } catch { /* The existing readThrough path records the diagnostic. */ }
-        if (unchanged) {
+      const changeSec = Math.floor(changeMs / 1000);
+      if (Number.isFinite(cachedAtMs) && Number.isFinite(changeMs)) {
+        if (cachedAtSec > changeSec) {
           result.skipped += 1;
           continue;
+        }
+        if (cachedAtSec === changeSec) {
+          // Consult the cache's existing content hash before treating the file
+          // as unchanged. Hash the UTF-8 text exactly the way the cache
+          // hashes it on write (not the raw bytes): for files that are not
+          // clean UTF-8 the two digests differ and every scan re-parses.
+          let unchanged = false;
+          try {
+            unchanged = createHash("sha256").update(readFileSync(filePath, "utf-8")).digest("hex") === cachedAt.source_hash;
+          } catch { /* The existing readThrough path records the diagnostic. */ }
+          if (unchanged) {
+            result.skipped += 1;
+            continue;
+          }
         }
       }
     }
