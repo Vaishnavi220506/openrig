@@ -436,7 +436,6 @@ function parsePsControls(opts: PsCliOptions): ParsedPsControls | { error: string
     !opts.nodes
     ? `Notice: --filter ${parsedFilter.key} is node-level and was not applied at the rig tier; use --nodes to apply it.`
     : undefined;
-  const appliedFilter = nodeOnlyFilterNotice ? null : parsedFilter;
 
   const limit = opts.limit !== undefined ? Number(opts.limit) : null;
   if (limit !== null && (!Number.isInteger(limit) || limit < 0)) {
@@ -453,10 +452,10 @@ function parsePsControls(opts: PsCliOptions): ParsedPsControls | { error: string
   }
 
   return {
-    parsedFilter: appliedFilter,
+    parsedFilter,
     limit,
     fields,
-    useEnvelope: appliedFilter !== null || limit !== null || fields !== null || opts.summary === true,
+    useEnvelope: parsedFilter !== null || limit !== null || fields !== null || opts.summary === true,
     nodeOnlyFilterNotice,
   };
 }
@@ -942,7 +941,10 @@ Exit codes:
         return;
       }
       const { parsedFilter, limit, fields, useEnvelope, nodeOnlyFilterNotice } = controls;
-      if (nodeOnlyFilterNotice) console.error(nodeOnlyFilterNotice);
+      // Local and fan-out paths render the notice here. A single-host path
+      // emits it in its transport-specific runner so SSH can let the remote
+      // command report it without duplicating the local notice.
+      if (nodeOnlyFilterNotice && !opts.host) console.error(nodeOnlyFilterNotice);
 
       if (opts.allHosts || opts.hosts) {
         // AggregatedPayload is the closed fan-out contract (items + hosts).
@@ -1523,7 +1525,8 @@ async function runHttpPs(
     process.exitCode = 1;
     return;
   }
-  const { parsedFilter, limit, fields, useEnvelope } = controls;
+  const { parsedFilter, limit, fields, useEnvelope, nodeOnlyFilterNotice } = controls;
+  if (nodeOnlyFilterNotice) console.error(nodeOnlyFilterNotice);
 
   // A4: stamp the origin triple on this remote read (fail-open to 2-part when unavailable).
   const originSelfHostId = await resolveOriginSelfHostId(deps.lifecycleDeps);
