@@ -134,13 +134,26 @@ export interface CurrentWorkDerivation {
   currentWorkBasis: string;
 }
 
-interface TaggedRow {
+export interface CurrentWorkRow {
   state?: string | null;
   tags?: string[] | null;
   /** Optional, but the production call site passes full queue items so it is populated
    *  there. A refusal that names the offending ROW is one command from actionable; one
    *  that names only the values leaves the reader to go find which row meant it. */
   qitemId?: string | null;
+}
+
+/**
+ * A workspace may have more than one catalogued missions root. Callers that
+ * still have one authoritative root can keep passing a string; catalog-aware
+ * callers resolve the root from the row's project tag.
+ */
+export type MissionsRootResolver = string | null | ((row: CurrentWorkRow) => string | null);
+
+type TaggedRow = CurrentWorkRow;
+
+function resolveMissionsRoot(resolver: MissionsRootResolver, row: CurrentWorkRow): string | null {
+  return typeof resolver === "function" ? resolver(row) : resolver;
 }
 
 /** How a row is referred to in a refusal. Falls back cleanly when no id was supplied. */
@@ -219,10 +232,11 @@ interface Candidate {
 
 /** Resolve one typed row to a work node, or to the reason it could not be resolved. */
 function resolveRow(
-  missionsRoot: string,
+  missionsRoot: string | null,
   mission: string,
   slice: string,
 ): { ok: true; value: Candidate } | { ok: false; reason: string } {
+  if (!missionsRoot) return { ok: false, reason: "no missions root configured" };
   const missionMatches = resolveWorkNodeDirs(missionsRoot, mission);
   if (missionMatches.length !== 1) {
     return {
@@ -254,7 +268,7 @@ function resolveRow(
 
 export function deriveCurrentWork(
   rows: TaggedRow[],
-  missionsRoot: string | null,
+  missionsRoot: MissionsRootResolver,
 ): CurrentWorkDerivation {
   const refuse = (currentWorkBasis: string): CurrentWorkDerivation => ({
     currentWork: null,
@@ -263,7 +277,7 @@ export function deriveCurrentWork(
 
   if (!missionsRoot) return refuse("no missions root configured");
 
-  const typed: { mission: string; slice: string; qitemId?: string | null }[] = [];
+  const typed: { row: TaggedRow; mission: string; slice: string; qitemId?: string | null }[] = [];
   const conflicts: string[] = [];
   for (const r of rows) {
     if (r.state !== "in-progress") continue;
@@ -287,7 +301,7 @@ export function deriveCurrentWork(
       );
       continue;
     }
-    typed.push({ mission: missions[0]!, slice: slices[0]!, qitemId: r.qitemId });
+    typed.push({ row: r, mission: missions[0]!, slice: slices[0]!, qitemId: r.qitemId });
   }
 
   // Conflicts outrank a usable sibling for the same reason an unresolved row does: the
@@ -305,8 +319,9 @@ export function deriveCurrentWork(
   // Resolve first, then count: different tag forms for one node must collapse to one node.
   const byPath = new Map<string, Candidate>();
   const failures: string[] = [];
-  for (const { mission, slice, qitemId } of typed) {
-    const resolved = resolveRow(missionsRoot, mission, slice);
+  for (const { row, mission, slice, qitemId } of typed) {
+    const root = resolveMissionsRoot(missionsRoot, row);
+    const resolved = resolveRow(root, mission, slice);
     if (resolved.ok) {
       if (!byPath.has(resolved.value.workNodePath)) {
         byPath.set(resolved.value.workNodePath, resolved.value);
@@ -473,7 +488,7 @@ function listMissions(missionsRoot: string | null): { names: string[]; truncated
 
 export function deriveWorkCandidates(
   rows: CandidateRow[],
-  missionsRoot: string | null,
+  missionsRoot: MissionsRootResolver,
   lookups: WorkCandidateLookups,
 ): WorkCandidates {
   const candidates: WorkCandidate[] = [];
@@ -511,7 +526,7 @@ export function deriveWorkCandidates(
       const slice = missions.length === 1 && slices.length === 1 ? slices[0]! : null;
       for (const mission of [...missions].sort()) {
         add({ kind: "tag", qitemId, mission, slice,
-          ...resolveTagged(missionsRoot, mission, slice),
+          ...resolveTagged(resolveMissionsRoot(missionsRoot, row), mission, slice),
           source: `tag mission:${mission}${slice ? ` + slice:${slice}` : ""} on ${rowLabel(qitemId)}` });
       }
       continue;
@@ -543,7 +558,7 @@ export function deriveWorkCandidates(
       }
       for (const mission of [...ancestorMissions].sort()) {
         add({ kind: "ancestry", qitemId, mission, slice: null,
-          ...resolveTagged(missionsRoot, mission, null),
+          ...resolveTagged(resolveMissionsRoot(missionsRoot, ancestor), mission, null),
           source: `handoff ancestor ${ancestorId} carries mission:${mission}; ${rowLabel(qitemId)} itself is untagged` });
       }
       found = true;
@@ -552,7 +567,7 @@ export function deriveWorkCandidates(
     if (!found) unknown.push({ qitemId, summary, reason: "no handoff ancestor carries a mission tag" });
   }
 
-  const listed = listMissions(missionsRoot);
-  return { missionsRoot, candidates, unknown, next, held,
+  const listed = listMissions(typeof missionsRoot === "function" ? null : missionsRoot);
+  return { missionsRoot: typeof missionsRoot === "function" ? null : missionsRoot, candidates, unknown, next, held,
     missionsOnHost: listed.names, missionsOnHostTruncated: listed.truncated };
 }

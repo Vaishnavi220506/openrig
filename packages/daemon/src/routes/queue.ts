@@ -20,7 +20,8 @@ import { loadHostRegistry, resolveHost } from "../domain/hosts/hosts-registry-re
 import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contract.js";
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
-import { deriveCurrentWork, deriveRole, deriveWorkCandidates, type RoleOrientation } from "../domain/current-work.js";
+import { deriveCurrentWork, deriveRole, deriveWorkCandidates, type CurrentWorkRow, type MissionsRootResolver, type RoleOrientation } from "../domain/current-work.js";
+import { listProjects } from "../domain/workspace/project-read.js";
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
 import type { HumanQuestion } from "../domain/human-questions.js";
@@ -872,12 +873,34 @@ export function queueRoutes(): Hono {
     } catch {
       missionsRoot = null;
     }
+    // Catalogued projects own their missions roots. A project-tagged baton must
+    // be resolved against that root, or queue whoami can either hide work from a
+    // sibling project or confidently point refocus at the wrong project when the
+    // projects use the same mission and slice names. Untagged legacy rows keep
+    // the configured single-root behavior.
+    let projectMissionsRoots: Map<string, string | null> | null = null;
+    try {
+      projectMissionsRoots = new Map(listProjects(c).projects.map((project) => [project.id, project.error ? null : project.missionsRoot]));
+    } catch {
+      // Preserve the legacy root when the catalog itself is unavailable; a
+      // catalog entry that is known but unusable still resolves to null above.
+    }
+    const currentWorkRoot: MissionsRootResolver = projectMissionsRoots
+      ? (row: CurrentWorkRow) => {
+        const projectIds = [...new Set((row.tags ?? []).flatMap((tag) => tag.split(",").map((part) => part.trim()))
+          .filter((tag) => tag.startsWith("project:") && tag.slice("project:".length).trim())
+          .map((tag) => tag.slice("project:".length).trim()))];
+        if (projectIds.length === 0) return missionsRoot;
+        if (projectIds.length !== 1) return null;
+        return projectMissionsRoots!.has(projectIds[0]!) ? projectMissionsRoots!.get(projectIds[0]!) ?? null : null;
+      }
+      : missionsRoot;
     // Deliberately NOT position.asDestination.recent: that is a capped, mixed-state display
     // projection, so a second in-progress baton past the cap would be invisible and the
     // ambiguity refusal would degrade into a confident wrong answer. The derivation reads
     // the unbounded in-progress set, which makes it independent of recentLimit.
     const inProgress = repo.listInProgressForDestination(session);
-    const derived = deriveCurrentWork(inProgress, missionsRoot);
+    const derived = deriveCurrentWork(inProgress, currentWorkRoot);
     let role: RoleOrientation = { state: "unknown", reason: "calling node unavailable", files: [] };
     try {
       const identity = (c.get("whoamiService" as never) as WhoamiService | undefined)
@@ -896,7 +919,7 @@ export function queueRoutes(): Hono {
       const nextTruncated = next.length > WORK_CANDIDATE_LIST_LIMIT;
       const workCandidates = deriveWorkCandidates(
         [...inProgress, ...held.slice(0, WORK_CANDIDATE_LIST_LIMIT), ...next.slice(0, WORK_CANDIDATE_LIST_LIMIT)],
-        missionsRoot,
+        currentWorkRoot,
         {
           getRow: (qitemId) => repo.getById(qitemId) ?? null,
           continuationOf: (qitemId) => repo.currentParkContinuation(qitemId),
