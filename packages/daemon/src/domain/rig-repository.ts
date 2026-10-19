@@ -17,6 +17,7 @@ import type {
   Snapshot,
   SnapshotData,
   SessionSourceSpec,
+  NodeLaunchRecipe,
 } from "./types.js";
 
 /**
@@ -141,6 +142,8 @@ interface NodeOptions {
   resolvedSpecName?: string;
   resolvedSpecVersion?: string;
   resolvedSpecHash?: string;
+  /** Validated pod-aware source used to rebuild a fresh launch after restart. */
+  launchRecipe?: NodeLaunchRecipe;
 }
 
 export class RigRepository {
@@ -502,9 +505,29 @@ export class RigRepository {
         .run(JSON.stringify(opts.env), id);
     }
 
+    if (opts?.launchRecipe && this.hasNodeColumn("launch_recipe_json")) {
+      this.db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+        .run(JSON.stringify(opts.launchRecipe), id);
+    }
+
     return this.rowToNode(
       this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as NodeRow
     );
+  }
+
+  /** Return the durable source for rebuilding a pod-aware seat, if available. */
+  getNodeLaunchRecipe(nodeId: string): NodeLaunchRecipe | null {
+    if (!this.hasNodeColumn("launch_recipe_json")) return null;
+    const row = this.db.prepare("SELECT launch_recipe_json FROM nodes WHERE id = ?").get(nodeId) as
+      { launch_recipe_json?: string | null } | undefined;
+    if (!row?.launch_recipe_json) return null;
+    try {
+      const recipe = JSON.parse(row.launch_recipe_json) as NodeLaunchRecipe;
+      if (recipe.version !== 1 || typeof recipe.rigRoot !== "string" || !recipe.rigSpec) return null;
+      return recipe;
+    } catch {
+      return null;
+    }
   }
 
   /** S5 (OPR.0.5.4.7) — the first supported nodes.model write (the inventory was insert-only;
@@ -895,6 +918,7 @@ interface NodeRow {
   profile: string | null;
   label: string | null;
   session_source_json?: string | null;
+  launch_recipe_json?: string | null;
   resolved_spec_name: string | null;
   resolved_spec_version: string | null;
   resolved_spec_hash: string | null;

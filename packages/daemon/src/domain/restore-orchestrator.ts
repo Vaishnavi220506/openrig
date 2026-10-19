@@ -186,6 +186,12 @@ interface RestoreOrchestratorDeps {
   transcriptStore?: TranscriptStore;
   serviceOrchestrator?: import("./service-orchestrator.js").ServiceOrchestrator;
   listProcesses?: () => Promise<Array<{ pid: number; ppid: number; command: string }>>;
+  /** Rebuild a deliberate fresh pod-aware launch from its persisted recipe. */
+  freshLaunch?: (rigId: string, nodeId: string) => Promise<{
+    status: "launched" | "failed" | "attention_required";
+    error?: string;
+    warnings?: string[];
+  }>;
 }
 
 export class RestoreOrchestrator {
@@ -205,6 +211,7 @@ export class RestoreOrchestrator {
   private transcriptStore: TranscriptStore | null;
   private serviceOrchestrator: import("./service-orchestrator.js").ServiceOrchestrator | null;
   private listProcesses: (() => Promise<Array<{ pid: number; ppid: number; command: string }>>) | undefined;
+  private freshLaunch: RestoreOrchestratorDeps["freshLaunch"];
   private appliedLaunchStore: AppliedLaunchObservationStore;
 
   constructor(deps: RestoreOrchestratorDeps) {
@@ -245,6 +252,7 @@ export class RestoreOrchestrator {
     this.transcriptStore = deps.transcriptStore ?? null;
     this.serviceOrchestrator = deps.serviceOrchestrator ?? null;
     this.listProcesses = deps.listProcesses;
+    this.freshLaunch = deps.freshLaunch;
     this.appliedLaunchStore = new AppliedLaunchObservationStore(deps.db);
   }
 
@@ -1345,6 +1353,29 @@ export class RestoreOrchestrator {
       && startupRuntime !== "terminal"
       && (!startupCtx || !startupAdapter)
     ) {
+      // A deliberate fresh launch with no captured startup context is the
+      // never-occupied-seat case from #49. The restore launcher has already
+      // created a shell, so remove that provisional session before handing the
+      // seat to the normal recipe-backed launch path. Resume requests stay on
+      // the fail-closed path below: no durable context means no safe resume.
+      if (!startupCtx && !resumeRequested && this.freshLaunch) {
+        await this.rollbackToZeroSession(node.id, sessionName, launchResult.session.id, priorState);
+        try {
+          const fresh = await this.freshLaunch(rigId, node.id);
+          if (fresh.warnings?.length) warnings?.push(...fresh.warnings);
+          if (fresh.status === "launched") {
+            return { nodeId: node.id, logicalId: node.logicalId, status: "fresh-primed" };
+          }
+          return { nodeId: node.id, logicalId: node.logicalId, status: fresh.status, error: fresh.error };
+        } catch (err) {
+          return {
+            nodeId: node.id,
+            logicalId: node.logicalId,
+            status: "failed",
+            error: `Fresh launch failed: ${(err as Error).message}`,
+          };
+        }
+      }
       const cause = startupCtx ? `no ${startupRuntime} runtime adapter` : "no startup context";
       const error = `Harness not started: ${cause} for ${node.logicalId}.`;
       warnings?.push(`Restore: ${error}`);

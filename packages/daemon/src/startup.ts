@@ -686,10 +686,22 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const composeAdapter = new ComposeServicesAdapter(opts?.tmuxExec ?? execCommand);
   const serviceOrchestrator = new ServiceOrchestrator({ rigRepo, composeAdapter });
 
+  // Filled after the pod-aware instantiator is constructed below. Keeping this
+  // callback late-bound avoids making restore depend on construction order while
+  // still giving fresh restores the same full launch path as `rig up`.
+  let persistedFreshPodLaunch: ((rigId: string, nodeId: string) => Promise<{
+    status: "launched" | "failed" | "attention_required";
+    error?: string;
+    warnings?: string[];
+  }>) | undefined;
+
   const restoreOrchestrator = new RestoreOrchestrator({
     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
     checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, piResume, ompResume,
     transcriptStore, serviceOrchestrator,
+    freshLaunch: async (rigId, nodeId) => persistedFreshPodLaunch
+      ? persistedFreshPodLaunch(rigId, nodeId)
+      : { status: "failed", error: "Pod instantiator is not ready for a fresh launch." },
   });
 
   // Connect to cmux at startup — degrades gracefully if absent
@@ -1048,6 +1060,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     },
     skillReconciler: reconcileSkillLoadout,
   });
+  persistedFreshPodLaunch = (rigId, nodeId) => podInstantiator.launchPersistedFresh(rigId, nodeId);
 
   const podBundleSourceResolver = new PodBundleSourceResolver();
 
