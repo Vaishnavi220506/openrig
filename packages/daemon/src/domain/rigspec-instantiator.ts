@@ -917,7 +917,7 @@ export class PodRigInstantiator {
         continue;
       }
 
-      const launched = await this.launchBinding({
+      const launched = await this.launchValidatedMember({
         rigId: targetRigId,
         rigSpec,
         rigRoot,
@@ -1905,6 +1905,20 @@ export class PodRigInstantiator {
     return { node, event };
   }
 
+  private launchValidatedMember(input: {
+    rigId: string;
+    rigSpec: PodRigSpec;
+    rigRoot: string;
+    pod: RigSpecPod;
+    member: RigSpecPodMember;
+    qualifiedId: string;
+    nodeId: string;
+    cwdOverride?: string;
+    envOverride?: SeatEnv;
+  }) {
+    return this.launchBinding(input);
+  }
+
   /**
    * launch-binding primitive (OPR.0.3.3.24): given an already-created node and
    * its member context, bring it fully live — harness launch + startup
@@ -1932,9 +1946,10 @@ export class PodRigInstantiator {
 
   /**
    * Rebuild a fresh pod-aware launch from the source captured at materialization.
-   * A missing startup context means there is no conversation to resume, but it
-   * must not prevent a new harness from being started for a seat whose validated
-   * launch recipe is available.
+   * A missing startup context means the daemon has no restorable startup
+   * context for this seat; it does not by itself prove that no conversation
+   * exists. It must not prevent a new harness from being started for a seat
+   * whose validated launch recipe is available.
    */
   async launchPersistedFresh(
     rigId: string,
@@ -1949,7 +1964,7 @@ export class PodRigInstantiator {
     const recipe = this.deps.rigRepo.getNodeLaunchRecipe(nodeId);
     if (!recipe) {
       return {
-        status: "failed",
+        status: "attention_required",
         error: `Fresh launch recipe unavailable for ${node.logicalId}; rematerialize the pod-aware rig before launching this seat.`,
       };
     }
@@ -1957,23 +1972,50 @@ export class PodRigInstantiator {
     const context = this.findMemberContext(recipe.rigSpec, node.logicalId);
     if (!context) {
       return {
-        status: "failed",
+        status: "attention_required",
         error: `Fresh launch recipe for ${node.logicalId} does not contain its member definition.`,
       };
     }
 
-    return this.launchBinding({
+    // The recipe supplies the authored source, while the retained node row is the
+    // latest operator choice. Keep those choices authoritative across a restart.
+    const member = {
+      ...context.member,
+      ...(node.model !== null ? { model: node.model } : {}),
+      ...(node.effort !== null && node.effort !== undefined ? { effort: node.effort } : {}),
+      ...(node.codexConfigProfile !== null && node.codexConfigProfile !== undefined
+        ? { codexConfigProfile: node.codexConfigProfile }
+        : {}),
+      ...(node.permissionPolicy !== null && node.permissionPolicy !== undefined
+        ? { permissionPolicy: node.permissionPolicy }
+        : {}),
+      ...(node.env !== null && node.env !== undefined ? { env: node.env } : {}),
+      ...(node.cwd !== null ? { cwd: node.cwd } : {}),
+      ...(node.restorePolicy !== null ? { restorePolicy: node.restorePolicy } : {}),
+      ...(node.sessionSource !== null && node.sessionSource !== undefined ? { sessionSource: node.sessionSource } : {}),
+    };
+
+    return this.launchValidatedMember({
       rigId,
       rigSpec: recipe.rigSpec,
       rigRoot: recipe.rigRoot,
       pod: context.pod,
-      member: context.member,
+      member,
       qualifiedId: node.logicalId,
       nodeId,
       // Preserve the resolved cwd from materialization, including a prior
       // --cwd-override, rather than silently falling back to process cwd.
       cwdOverride: node.cwd ?? undefined,
     });
+  }
+
+  /** Whether a persisted recipe contains enough validated source to attempt a fresh launch. */
+  canLaunchPersistedFresh(rigId: string, nodeId: string): boolean {
+    const rig = this.deps.rigRepo.getRig(rigId);
+    const node = rig?.nodes.find((candidate) => candidate.id === nodeId);
+    if (!rig || !node) return false;
+    const recipe = this.deps.rigRepo.getNodeLaunchRecipe(nodeId);
+    return recipe ? this.findMemberContext(recipe.rigSpec, node.logicalId) !== null : false;
   }
 
   /**

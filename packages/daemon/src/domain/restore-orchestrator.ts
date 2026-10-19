@@ -192,6 +192,8 @@ interface RestoreOrchestratorDeps {
     error?: string;
     warnings?: string[];
   }>;
+  /** Return whether a persisted fresh launch can be attempted without discarding the current pane. */
+  freshLaunchAvailable?: (rigId: string, nodeId: string) => boolean;
 }
 
 export class RestoreOrchestrator {
@@ -212,6 +214,7 @@ export class RestoreOrchestrator {
   private serviceOrchestrator: import("./service-orchestrator.js").ServiceOrchestrator | null;
   private listProcesses: (() => Promise<Array<{ pid: number; ppid: number; command: string }>>) | undefined;
   private freshLaunch: RestoreOrchestratorDeps["freshLaunch"];
+  private freshLaunchAvailable: RestoreOrchestratorDeps["freshLaunchAvailable"];
   private appliedLaunchStore: AppliedLaunchObservationStore;
 
   constructor(deps: RestoreOrchestratorDeps) {
@@ -253,6 +256,7 @@ export class RestoreOrchestrator {
     this.serviceOrchestrator = deps.serviceOrchestrator ?? null;
     this.listProcesses = deps.listProcesses;
     this.freshLaunch = deps.freshLaunch;
+    this.freshLaunchAvailable = deps.freshLaunchAvailable;
     this.appliedLaunchStore = new AppliedLaunchObservationStore(deps.db);
   }
 
@@ -1115,6 +1119,18 @@ export class RestoreOrchestrator {
     }
   }
 
+  /** Retire only the provisional session created by this restore attempt. The prior
+   * binding must stay cleared while a replacement launch is handed off. */
+  private async retireProvisionalSession(nodeId: string, sessionName: string, launchedSessionId: string | undefined): Promise<void> {
+    try {
+      await this.tmuxAdapter.killSession(sessionName);
+    } catch { /* best-effort — the row + projection rollback below is the source of truth */ }
+    if (launchedSessionId) {
+      try { this.sessionRegistry.updateStatus(launchedSessionId, "superseded"); } catch { /* best-effort */ }
+    }
+    this.sessionRegistry.clearBinding(nodeId);
+  }
+
   private async postLaunchRestore(
     entry: PlanEntry,
     rigId: string,
@@ -1359,15 +1375,25 @@ export class RestoreOrchestrator {
       // seat to the normal recipe-backed launch path. Resume requests stay on
       // the fail-closed path below: no durable context means no safe resume.
       if (!startupCtx && !resumeRequested && this.freshLaunch) {
-        await this.rollbackToZeroSession(node.id, sessionName, launchResult.session.id, priorState);
+        // Keep the usable provisional shell when the callback exists but its
+        // recipe/member inputs are unavailable. A callback being present alone
+        // is not proof that a fresh launch can actually be attempted.
+        if (this.freshLaunchAvailable && !this.freshLaunchAvailable(rigId, node.id)) {
+          const error = `Harness not started: no usable persisted launch recipe for ${node.logicalId}.`;
+          warnings?.push(`Restore: ${error}`);
+          return { nodeId: node.id, logicalId: node.logicalId, status: "attention_required", error };
+        }
+        await this.retireProvisionalSession(node.id, sessionName, launchResult.session.id);
         try {
           const fresh = await this.freshLaunch(rigId, node.id);
           if (fresh.warnings?.length) warnings?.push(...fresh.warnings);
           if (fresh.status === "launched") {
             return { nodeId: node.id, logicalId: node.logicalId, status: "fresh-primed" };
           }
+          if (fresh.status === "failed" && priorState) this.restoreNodeState(node.id, priorState);
           return { nodeId: node.id, logicalId: node.logicalId, status: fresh.status, error: fresh.error };
         } catch (err) {
+          if (priorState) this.restoreNodeState(node.id, priorState);
           return {
             nodeId: node.id,
             logicalId: node.logicalId,

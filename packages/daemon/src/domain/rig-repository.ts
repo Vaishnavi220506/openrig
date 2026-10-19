@@ -20,6 +20,26 @@ import type {
   NodeLaunchRecipe,
 } from "./types.js";
 
+function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const spec = value as Record<string, unknown>;
+  if (typeof spec.version !== "string" || typeof spec.name !== "string" || !Array.isArray(spec.pods)) return false;
+  return spec.pods.every((pod) => {
+    if (pod === null || typeof pod !== "object" || Array.isArray(pod)) return false;
+    const candidate = pod as Record<string, unknown>;
+    if (typeof candidate.id !== "string" || typeof candidate.label !== "string" || !Array.isArray(candidate.members)) return false;
+    return candidate.members.every((member) => {
+      if (member === null || typeof member !== "object" || Array.isArray(member)) return false;
+      const entry = member as Record<string, unknown>;
+      return typeof entry.id === "string"
+        && typeof entry.agentRef === "string"
+        && typeof entry.profile === "string"
+        && typeof entry.runtime === "string"
+        && typeof entry.cwd === "string";
+    });
+  });
+}
+
 /**
  * Free helper: returns the latest snapshot for a rig whose data carries non-null
  * `resume_token` for at least one persisted session, or null otherwise.
@@ -522,9 +542,10 @@ export class RigRepository {
       { launch_recipe_json?: string | null } | undefined;
     if (!row?.launch_recipe_json) return null;
     try {
-      const recipe = JSON.parse(row.launch_recipe_json) as NodeLaunchRecipe;
+      const recipe = JSON.parse(row.launch_recipe_json) as Partial<NodeLaunchRecipe>;
       if (recipe.version !== 1 || typeof recipe.rigRoot !== "string" || !recipe.rigSpec) return null;
-      return recipe;
+      if (!isStoredRigSpec(recipe.rigSpec)) return null;
+      return recipe as NodeLaunchRecipe;
     } catch {
       return null;
     }

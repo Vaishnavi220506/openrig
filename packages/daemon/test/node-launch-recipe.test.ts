@@ -58,4 +58,67 @@ describe("persisted pod-aware launch recipes", () => {
       pod: expect.objectContaining({ id: "dev", label: "Development" }),
     }));
   });
+
+  it("keeps saved seat choices authoritative over the recipe defaults", async () => {
+    db = createFullTestDb();
+    const setup = createTestApp(db);
+    const rig = setup.rigRepo.createRig("saved-choice-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)")
+      .run("pod-saved-choice", rig.id, "dev", "Development");
+
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", {
+      runtime: "codex",
+      model: "saved-model",
+      effort: "saved-effort",
+      codexConfigProfile: "saved-profile",
+      cwd: "/saved/cwd",
+      podId: "pod-saved-choice",
+      launchRecipe: {
+        version: 1,
+        rigRoot: "/workspace/saved-choice-rig",
+        rigSpec: {
+          version: "0.2",
+          name: "saved-choice-rig",
+          pods: [{
+            id: "dev",
+            label: "Development",
+            members: [{
+              id: "impl",
+              agentRef: "local:agents/impl",
+              profile: "default",
+              runtime: "codex",
+              model: "recipe-model",
+              effort: "recipe-effort",
+              codexConfigProfile: "recipe-profile",
+              cwd: ".",
+            }],
+            edges: [],
+          }],
+          edges: [],
+        },
+      },
+    });
+
+    const launchBinding = vi.spyOn(setup.podInstantiator, "launchBinding")
+      .mockResolvedValue({ status: "launched" });
+    await setup.podInstantiator.launchPersistedFresh(rig.id, node.id);
+
+    expect(launchBinding.mock.calls[0]?.[0].member).toEqual(expect.objectContaining({
+      model: "saved-model",
+      effort: "saved-effort",
+      codexConfigProfile: "saved-profile",
+      cwd: "/saved/cwd",
+    }));
+  });
+
+  it("rejects malformed stored specs without throwing", async () => {
+    db = createFullTestDb();
+    const setup = createTestApp(db);
+    const rig = setup.rigRepo.createRig("malformed-recipe-rig");
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex" });
+    db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+      .run(JSON.stringify({ version: 1, rigRoot: "/workspace", rigSpec: { version: "0.2", name: "broken", pods: {} } }), node.id);
+
+    expect(setup.rigRepo.getNodeLaunchRecipe(node.id)).toBeNull();
+  });
 });

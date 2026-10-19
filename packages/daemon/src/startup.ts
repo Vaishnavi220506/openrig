@@ -694,6 +694,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     error?: string;
     warnings?: string[];
   }>) | undefined;
+  let persistedFreshPodLaunchAvailable: ((rigId: string, nodeId: string) => boolean) | undefined;
 
   const restoreOrchestrator = new RestoreOrchestrator({
     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
@@ -702,6 +703,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     freshLaunch: async (rigId, nodeId) => persistedFreshPodLaunch
       ? persistedFreshPodLaunch(rigId, nodeId)
       : { status: "failed", error: "Pod instantiator is not ready for a fresh launch." },
+    freshLaunchAvailable: (rigId, nodeId) => persistedFreshPodLaunchAvailable?.(rigId, nodeId) ?? false,
   });
 
   // Connect to cmux at startup — degrades gracefully if absent
@@ -1061,6 +1063,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     skillReconciler: reconcileSkillLoadout,
   });
   persistedFreshPodLaunch = (rigId, nodeId) => podInstantiator.launchPersistedFresh(rigId, nodeId);
+  persistedFreshPodLaunchAvailable = (rigId, nodeId) => podInstantiator.canLaunchPersistedFresh(rigId, nodeId);
 
   const podBundleSourceResolver = new PodBundleSourceResolver();
 
