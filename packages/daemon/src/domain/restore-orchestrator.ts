@@ -1121,14 +1121,19 @@ export class RestoreOrchestrator {
 
   /** Retire only the provisional session created by this restore attempt. The prior
    * binding must stay cleared while a replacement launch is handed off. */
-  private async retireProvisionalSession(nodeId: string, sessionName: string, launchedSessionId: string | undefined): Promise<void> {
+  private async retireProvisionalSession(nodeId: string, sessionName: string, launchedSessionId: string | undefined): Promise<{ ok: true } | { ok: false; error: string }> {
+    let stopped: import("../adapters/tmux.js").TmuxResult;
     try {
-      await this.tmuxAdapter.killSession(sessionName);
-    } catch { /* best-effort — the row + projection rollback below is the source of truth */ }
+      stopped = await this.tmuxAdapter.killSession(sessionName);
+    } catch (error) {
+      return { ok: false, error: `could not retire provisional session: ${(error as Error).message}` };
+    }
+    if (!stopped.ok) return { ok: false, error: `could not retire provisional session: ${stopped.message}` };
     if (launchedSessionId) {
       try { this.sessionRegistry.updateStatus(launchedSessionId, "superseded"); } catch { /* best-effort */ }
     }
     this.sessionRegistry.clearBinding(nodeId);
+    return { ok: true };
   }
 
   private async postLaunchRestore(
@@ -1383,17 +1388,25 @@ export class RestoreOrchestrator {
           warnings?.push(`Restore: ${error}`);
           return { nodeId: node.id, logicalId: node.logicalId, status: "attention_required", error };
         }
-        await this.retireProvisionalSession(node.id, sessionName, launchResult.session.id);
+        const retired = await this.retireProvisionalSession(node.id, sessionName, launchResult.session.id);
+        if (!retired.ok) {
+          warnings?.push(`Restore: ${retired.error}`);
+          return { nodeId: node.id, logicalId: node.logicalId, status: "attention_required", error: retired.error };
+        }
+        const replacementExists = () => this.sessionRegistry.getSessionsForRig(rigId)
+          .some((candidate) => candidate.nodeId === node.id
+            && candidate.status === "running"
+            && candidate.id !== launchResult.session.id);
         try {
           const fresh = await this.freshLaunch(rigId, node.id);
           if (fresh.warnings?.length) warnings?.push(...fresh.warnings);
           if (fresh.status === "launched") {
             return { nodeId: node.id, logicalId: node.logicalId, status: "fresh-primed" };
           }
-          if (fresh.status === "failed" && priorState) this.restoreNodeState(node.id, priorState);
+          if (priorState && !replacementExists()) this.restoreNodeState(node.id, priorState);
           return { nodeId: node.id, logicalId: node.logicalId, status: fresh.status, error: fresh.error };
         } catch (err) {
-          if (priorState) this.restoreNodeState(node.id, priorState);
+          if (priorState && !replacementExists()) this.restoreNodeState(node.id, priorState);
           return {
             nodeId: node.id,
             logicalId: node.logicalId,

@@ -281,6 +281,13 @@ export function createTestApp(
      *  (defaults to daemon-shipped assets). Tests inject fixtures to exercise the nonfatal
      *  delivery-gap warning through the real /api/up route. */
     claudeActivityAssets?: { relayPath?: string; manifestPath?: string };
+    /** Optional persisted fresh-launch callbacks for restore-to-instantiator integration tests. */
+    freshLaunch?: (rigId: string, nodeId: string) => Promise<{
+      status: "launched" | "failed" | "attention_required";
+      error?: string;
+      warnings?: string[];
+    }>;
+    freshLaunchAvailable?: (rigId: string, nodeId: string) => boolean;
     /** Wire the ready runtime adapters into the routes' `runtimeAdapters`, as startup does, so a
      *  route launch can start harnesses. Off by default: existing tests keep no route adapters. */
     wireRuntimeAdapters?: boolean;
@@ -315,6 +322,8 @@ export function createTestApp(
     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
     checkpointStore, nodeLauncher, tmuxAdapter: tmux, claudeResume, codexResume,
     ...(opts?.listProcesses ? { listProcesses: opts.listProcesses } : {}),
+    ...(opts?.freshLaunch ? { freshLaunch: opts.freshLaunch } : {}),
+    ...(opts?.freshLaunchAvailable ? { freshLaunchAvailable: opts.freshLaunchAvailable } : {}),
   });
   const podRepo = new PodRepository(db);
   const rigSpecExporter = new RigSpecExporter({ rigRepo, sessionRegistry, podRepo });

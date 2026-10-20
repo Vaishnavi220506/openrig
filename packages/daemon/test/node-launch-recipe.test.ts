@@ -121,4 +121,92 @@ describe("persisted pod-aware launch recipes", () => {
 
     expect(setup.rigRepo.getNodeLaunchRecipe(node.id)).toBeNull();
   });
+
+  it("restores through the real restore-to-instantiator callback with a fresh instantiator", async () => {
+    db = createFullTestDb();
+    let setup!: ReturnType<typeof createTestApp>;
+    const freshLaunch = vi.fn(async (rigId: string, nodeId: string) => setup.podInstantiator.launchPersistedFresh(rigId, nodeId));
+    const freshLaunchAvailable = vi.fn((rigId: string, nodeId: string) => setup.podInstantiator.canLaunchPersistedFresh(rigId, nodeId));
+    const agentYaml = `name: impl\nversion: "1.0.0"\nresources:\n  skills: []\n  guidance: []\n  subagents: []\n  plugins: []\n  runtime_resources: []\nprofiles:\n  default: {}\n`;
+    setup = createTestApp(db, {
+      freshLaunch,
+      freshLaunchAvailable,
+      podInstantiatorFsOps: {
+        exists: (file) => file.replaceAll("\\", "/").endsWith("/agents/impl/agent.yaml"),
+        readFile: () => agentYaml,
+      },
+    });
+    const runtimeAdapter = {
+      runtime: "codex",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness: vi.fn(async () => ({ ok: true as const })),
+    };
+    const rig = setup.rigRepo.createRig("reopened-recipe-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)")
+      .run("pod-reopened", rig.id, "dev", "Development");
+    const rigRoot = process.cwd();
+    const rigSpec: RigSpec = {
+      version: "0.2",
+      name: "reopened-recipe-rig",
+      pods: [{
+        id: "dev",
+        label: "Development",
+        members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }],
+        edges: [],
+      }],
+      edges: [],
+    };
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", {
+      runtime: "codex",
+      agentRef: "local:agents/impl",
+      profile: "default",
+      cwd: rigRoot,
+      podId: "pod-reopened",
+      launchRecipe: { version: 1, rigRoot, rigSpec },
+    });
+    const session = setup.sessionRegistry.registerSession(node.id, "dev-impl@reopened-recipe-rig");
+    setup.sessionRegistry.updateStatus(session.id, "running");
+    const snapshot = setup.snapshotCapture.captureSnapshot(rig.id, "recipe-reopen");
+    setup.sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+    const result = await setup.restoreOrchestrator.restore(snapshot.id, {
+      adapters: { codex: runtimeAdapter },
+      freshLogicalIds: [node.logicalId],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(freshLaunch).toHaveBeenCalledWith(rig.id, node.id);
+    if (result.ok) {
+      expect(result.result.nodes.find((entry) => entry.nodeId === node.id)?.status).toBe("fresh-primed");
+    }
+  });
+
+  it.each([
+    { label: "permission policy", field: "permissionPolicy", value: {} },
+    { label: "environment", field: "env", value: [] },
+    { label: "session source", field: "sessionSource", value: { mode: "rebuild", ref: { kind: "artifact_set", value: "not-an-array" } } },
+    { label: "starter reference", field: "starterRef", value: { name: 42 } },
+  ])("rejects malformed optional $label inputs without throwing", async ({ field, value }) => {
+    db = createFullTestDb();
+    const setup = createTestApp(db);
+    const rig = setup.rigRepo.createRig(`malformed-${field}-rig`);
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex" });
+    db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+      .run(JSON.stringify({
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "broken",
+          pods: [{ id: "dev", label: "Dev", members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: ".", [field]: value }], edges: [] }],
+          edges: [],
+        },
+      }), node.id);
+
+    expect(setup.rigRepo.getNodeLaunchRecipe(node.id)).toBeNull();
+  });
 });

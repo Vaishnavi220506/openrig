@@ -2913,6 +2913,56 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
+  it("keeps the provisional shell when retirement is not confirmed", async () => {
+    const rig = rigRepo.createRig("retire-refusal-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-retire-refusal", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.design", { runtime: "claude-code", podId: "pod-retire-refusal" });
+    const session = sessionRegistry.registerSession(node.id, "dev-design@retire-refusal-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+    const tmux = mockTmux();
+    tmux.killSession = vi.fn(async () => ({ ok: false as const, code: "guard_target_unknown", message: "pane ownership was not confirmed" }));
+    const freshLaunch = vi.fn(async () => ({ status: "launched" as const }));
+
+    const result = await createOrchestrator({ tmux, freshLaunch }).restore(snap.id, {
+      adapters: { "claude-code": { runtime: "claude-code" } as RuntimeAdapter },
+      freshLogicalIds: [node.logicalId],
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.result.nodes[0]).toMatchObject({ status: "attention_required", error: expect.stringContaining("retire provisional session") });
+    expect(freshLaunch).not.toHaveBeenCalled();
+    expect(tmux.killSession).toHaveBeenCalledOnce();
+  });
+
+  it("does not restore stale prior state after a replacement session exists", async () => {
+    const rig = rigRepo.createRig("replacement-failure-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-replacement", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.design", { runtime: "claude-code", podId: "pod-replacement" });
+    const prior = sessionRegistry.registerSession(node.id, "dev-design@replacement-failure-rig");
+    sessionRegistry.updateStatus(prior.id, "running");
+    sessionRegistry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: prior.sessionName });
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(prior.id, "exited");
+    const freshLaunch = vi.fn(async () => {
+      const replacement = sessionRegistry.registerSession(node.id, "replacement@replacement-failure-rig");
+      sessionRegistry.updateStatus(replacement.id, "running");
+      return { status: "failed" as const, error: "post-launch delivery failed" };
+    });
+
+    const result = await createOrchestrator({ freshLaunch }).restore(snap.id, {
+      adapters: { "claude-code": { runtime: "claude-code" } as RuntimeAdapter },
+      freshLogicalIds: [node.logicalId],
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.result.nodes[0]).toMatchObject({ status: "failed", error: "post-launch delivery failed" });
+    expect(sessionRegistry.getSessionsForRig(rig.id).find((candidate) => candidate.sessionName === "replacement@replacement-failure-rig")?.status).toBe("running");
+    expect(db.prepare("SELECT node_id FROM bindings WHERE node_id = ?").get(node.id)).toBeUndefined();
+  });
+
   // Updated by codex-auth-refusal-attention-required slice (revision 2):
   // pod-aware nodes whose StartupOrchestrator returns
   // `startupStatus: "attention_required"` (any attention-required readiness

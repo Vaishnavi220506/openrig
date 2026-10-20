@@ -20,10 +20,72 @@ import type {
   NodeLaunchRecipe,
 } from "./types.js";
 
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isStoredSessionSource(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const source = value as Record<string, unknown>;
+  const ref = source.ref;
+  if (ref === null || typeof ref !== "object" || Array.isArray(ref)) return false;
+  const refRecord = ref as Record<string, unknown>;
+  if (source.mode === "fork") {
+    return ["native_id", "artifact_path", "name", "last"].includes(String(refRecord.kind))
+      && (refRecord.value === undefined || typeof refRecord.value === "string");
+  }
+  if (source.mode === "rebuild") {
+    return refRecord.kind === "artifact_set"
+      && Array.isArray(refRecord.value)
+      && refRecord.value.length > 0
+      && refRecord.value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
+  }
+  if (source.mode === "agent_image") {
+    return refRecord.kind === "image_name"
+      && typeof refRecord.value === "string"
+      && refRecord.value.trim().length > 0
+      && (refRecord.version === undefined || typeof refRecord.version === "string");
+  }
+  return false;
+}
+
+function isStoredStartupBlock(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const startup = value as Record<string, unknown>;
+  if (!Array.isArray(startup.files) || !Array.isArray(startup.actions)) return false;
+  const fileHints = ["auto", "guidance_merge", "skill_install", "send_text"];
+  const phases = ["fresh_start", "restore"];
+  const actionTypes = ["slash_command", "send_text", "startup_proof"];
+  const actionPhases = ["after_files", "after_ready"];
+  return startup.files.every((file) => {
+    if (file === null || typeof file !== "object" || Array.isArray(file)) return false;
+    const entry = file as Record<string, unknown>;
+    return typeof entry.path === "string"
+      && fileHints.includes(String(entry.deliveryHint))
+      && typeof entry.required === "boolean"
+      && Array.isArray(entry.appliesOn)
+      && entry.appliesOn.every((phase) => phases.includes(String(phase)))
+      && (entry.orientation === undefined || entry.orientation === "role")
+      && (entry.kind === undefined || entry.kind === "file");
+  }) && startup.actions.every((action) => {
+    if (action === null || typeof action !== "object" || Array.isArray(action)) return false;
+    const entry = action as Record<string, unknown>;
+    return actionTypes.includes(String(entry.type))
+      && typeof entry.value === "string"
+      && actionPhases.includes(String(entry.phase))
+      && typeof entry.idempotent === "boolean";
+  });
+}
+
 function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const spec = value as Record<string, unknown>;
   if (typeof spec.version !== "string" || typeof spec.name !== "string" || !Array.isArray(spec.pods)) return false;
+  if (spec.nonInterruptive !== undefined && typeof spec.nonInterruptive !== "boolean") return false;
+  if (spec.permissionPolicy !== undefined && typeof spec.permissionPolicy !== "string") return false;
+  if (spec.env !== undefined && !isStringRecord(spec.env)) return false;
+  if (spec.startup !== undefined && !isStoredStartupBlock(spec.startup)) return false;
   return spec.pods.every((pod) => {
     if (pod === null || typeof pod !== "object" || Array.isArray(pod)) return false;
     const candidate = pod as Record<string, unknown>;
@@ -35,7 +97,22 @@ function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
         && typeof entry.agentRef === "string"
         && typeof entry.profile === "string"
         && typeof entry.runtime === "string"
-        && typeof entry.cwd === "string";
+        && typeof entry.cwd === "string"
+        && (entry.label === undefined || typeof entry.label === "string")
+        && (entry.codexConfigProfile === undefined || typeof entry.codexConfigProfile === "string")
+        && (entry.model === undefined || typeof entry.model === "string")
+        && (entry.effort === undefined || typeof entry.effort === "string")
+        && (entry.role === undefined || typeof entry.role === "string")
+        && (entry.permissionPolicy === undefined || typeof entry.permissionPolicy === "string")
+        && (entry.env === undefined || isStringRecord(entry.env))
+        && (entry.restorePolicy === undefined || typeof entry.restorePolicy === "string")
+        && (entry.compactionStrategy === undefined || typeof entry.compactionStrategy === "string")
+        && (entry.mechanic === undefined || typeof entry.mechanic === "string")
+        && (entry.startup === undefined || isStoredStartupBlock(entry.startup))
+        && (entry.sessionSource === undefined || isStoredSessionSource(entry.sessionSource))
+        && (entry.starterRef === undefined
+          || (entry.starterRef !== null && typeof entry.starterRef === "object" && !Array.isArray(entry.starterRef)
+            && typeof (entry.starterRef as Record<string, unknown>).name === "string"));
     });
   });
 }
