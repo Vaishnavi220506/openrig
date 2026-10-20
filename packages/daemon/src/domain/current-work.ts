@@ -148,12 +148,18 @@ export interface CurrentWorkRow {
  * still have one authoritative root can keep passing a string; catalog-aware
  * callers resolve the root from the row's project tag.
  */
-export type MissionsRootResolver = string | null | ((row: CurrentWorkRow) => string | null);
+export interface MissionsRootResolution {
+  root: string | null;
+  reason?: string;
+}
+
+export type MissionsRootResolver = string | null | ((row: CurrentWorkRow) => string | null | MissionsRootResolution);
 
 type TaggedRow = CurrentWorkRow;
 
-function resolveMissionsRoot(resolver: MissionsRootResolver, row: CurrentWorkRow): string | null {
-  return typeof resolver === "function" ? resolver(row) : resolver;
+function resolveMissionsRoot(resolver: MissionsRootResolver, row: CurrentWorkRow): MissionsRootResolution {
+  const resolved = typeof resolver === "function" ? resolver(row) : resolver;
+  return typeof resolved === "object" && resolved !== null ? resolved : { root: resolved };
 }
 
 /** How a row is referred to in a refusal. Falls back cleanly when no id was supplied. */
@@ -321,13 +327,14 @@ export function deriveCurrentWork(
   const failures: string[] = [];
   for (const { row, mission, slice, qitemId } of typed) {
     const root = resolveMissionsRoot(missionsRoot, row);
-    const resolved = resolveRow(root, mission, slice);
+    const resolved = resolveRow(root.root, mission, slice);
     if (resolved.ok) {
+      if (root.reason) resolved.value.basis += `; ${root.reason}`;
       if (!byPath.has(resolved.value.workNodePath)) {
         byPath.set(resolved.value.workNodePath, resolved.value);
       }
     } else {
-      const reason = `${rowLabel(qitemId)} — ${resolved.reason}`;
+      const reason = `${rowLabel(qitemId)} — ${[root.reason, resolved.reason].filter(Boolean).join("; ")}`;
       if (!failures.includes(reason)) failures.push(reason);
     }
   }
@@ -490,6 +497,7 @@ export function deriveWorkCandidates(
   rows: CandidateRow[],
   missionsRoot: MissionsRootResolver,
   lookups: WorkCandidateLookups,
+  defaultMissionsRoot: string | null = typeof missionsRoot === "string" ? missionsRoot : null,
 ): WorkCandidates {
   const candidates: WorkCandidate[] = [];
   const unknown: WorkCandidates["unknown"] = [];
@@ -525,8 +533,11 @@ export function deriveWorkCandidates(
       // than paired by array position.
       const slice = missions.length === 1 && slices.length === 1 ? slices[0]! : null;
       for (const mission of [...missions].sort()) {
+        const root = resolveMissionsRoot(missionsRoot, row);
+        const resolved = resolveTagged(root.root, mission, slice);
         add({ kind: "tag", qitemId, mission, slice,
-          ...resolveTagged(resolveMissionsRoot(missionsRoot, row), mission, slice),
+          ...resolved,
+          unresolved: [root.reason, resolved.unresolved].filter(Boolean).join("; ") || null,
           source: `tag mission:${mission}${slice ? ` + slice:${slice}` : ""} on ${rowLabel(qitemId)}` });
       }
       continue;
@@ -557,8 +568,11 @@ export function deriveWorkCandidates(
         break;
       }
       for (const mission of [...ancestorMissions].sort()) {
+        const root = resolveMissionsRoot(missionsRoot, ancestor);
+        const resolved = resolveTagged(root.root, mission, null);
         add({ kind: "ancestry", qitemId, mission, slice: null,
-          ...resolveTagged(resolveMissionsRoot(missionsRoot, ancestor), mission, null),
+          ...resolved,
+          unresolved: [root.reason, resolved.unresolved].filter(Boolean).join("; ") || null,
           source: `handoff ancestor ${ancestorId} carries mission:${mission}; ${rowLabel(qitemId)} itself is untagged` });
       }
       found = true;
@@ -567,7 +581,7 @@ export function deriveWorkCandidates(
     if (!found) unknown.push({ qitemId, summary, reason: "no handoff ancestor carries a mission tag" });
   }
 
-  const listed = listMissions(typeof missionsRoot === "function" ? null : missionsRoot);
-  return { missionsRoot: typeof missionsRoot === "function" ? null : missionsRoot, candidates, unknown, next, held,
+  const listed = listMissions(defaultMissionsRoot);
+  return { missionsRoot: defaultMissionsRoot, candidates, unknown, next, held,
     missionsOnHost: listed.names, missionsOnHostTruncated: listed.truncated };
 }

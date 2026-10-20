@@ -21,7 +21,8 @@ import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contr
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { deriveCurrentWork, deriveRole, deriveWorkCandidates, type CurrentWorkRow, type MissionsRootResolver, type RoleOrientation } from "../domain/current-work.js";
-import { listProjects } from "../domain/workspace/project-read.js";
+import { listProjects, projectCatalogPaths } from "../domain/workspace/project-read.js";
+import { readProjectCatalog } from "../domain/workspace/project-catalog.js";
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
 import type { HumanQuestion } from "../domain/human-questions.js";
@@ -873,28 +874,42 @@ export function queueRoutes(): Hono {
     } catch {
       missionsRoot = null;
     }
-    // Catalogued projects own their missions roots. A project-tagged baton must
-    // be resolved against that root, or queue whoami can either hide work from a
-    // sibling project or confidently point refocus at the wrong project when the
-    // projects use the same mission and slice names. Untagged legacy rows keep
-    // the configured single-root behavior.
-    let projectMissionsRoots: Map<string, string | null> | null = null;
+    // Catalogued projects own their missions roots only when exactly one project
+    // tag names a healthy catalog entry. Every other project-tag case falls back
+    // to the configured root and records why, so whoami never turns an unusable
+    // catalog hint into a confident wrong-project answer.
+    let catalogStatus: "missing" | "usable" | "unavailable" = "missing";
+    let projectMissionsRoots = new Map<string, { root: string | null; error?: string }>();
     try {
-      projectMissionsRoots = new Map(listProjects(c).projects.map((project) => [project.id, project.error ? null : project.missionsRoot]));
-    } catch {
-      // Preserve the legacy root when the catalog itself is unavailable; a
-      // catalog entry that is known but unusable still resolves to null above.
-    }
-    const currentWorkRoot: MissionsRootResolver = projectMissionsRoots
-      ? (row: CurrentWorkRow) => {
-        const projectIds = [...new Set((row.tags ?? []).flatMap((tag) => tag.split(",").map((part) => part.trim()))
-          .filter((tag) => tag.startsWith("project:") && tag.slice("project:".length).trim())
-          .map((tag) => tag.slice("project:".length).trim()))];
-        if (projectIds.length === 0) return missionsRoot;
-        if (projectIds.length !== 1) return null;
-        return projectMissionsRoots!.has(projectIds[0]!) ? projectMissionsRoots!.get(projectIds[0]!) ?? null : null;
+      const { catalog } = projectCatalogPaths(c);
+      const entries = readProjectCatalog(catalog);
+      if (entries) {
+        catalogStatus = "usable";
+        projectMissionsRoots = new Map(listProjects(c).projects.map((project) => [project.id, {
+          root: project.error ? null : project.missionsRoot,
+          error: project.error,
+        }]));
       }
-      : missionsRoot;
+    } catch {
+      catalogStatus = "unavailable";
+    }
+    const currentWorkRoot: MissionsRootResolver = (row: CurrentWorkRow) => {
+      const projectIds = [...new Set((row.tags ?? []).flatMap((tag) => tag.split(",").map((part) => part.trim()))
+        .filter((tag) => tag.startsWith("project:") && tag.slice("project:".length).trim())
+        .map((tag) => tag.slice("project:".length).trim()))];
+      if (projectIds.length === 0) return { root: missionsRoot };
+      if (projectIds.length !== 1) {
+        return { root: missionsRoot, reason: `multiple project tags (${projectIds.join(", ")}); used configured root` };
+      }
+      const projectId = projectIds[0]!;
+      if (catalogStatus !== "usable") {
+        return { root: missionsRoot, reason: `project:${projectId} could not be used because the workspace catalog is ${catalogStatus === "missing" ? "not configured" : "unavailable"}; used configured root` };
+      }
+      const project = projectMissionsRoots.get(projectId);
+      if (!project) return { root: missionsRoot, reason: `project:${projectId} is not in the project catalogue; used configured root` };
+      if (project.error || !project.root) return { root: missionsRoot, reason: `project:${projectId} is unavailable in the project catalogue; used configured root` };
+      return { root: project.root };
+    };
     // Deliberately NOT position.asDestination.recent: that is a capped, mixed-state display
     // projection, so a second in-progress baton past the cap would be invisible and the
     // ambiguity refusal would degrade into a confident wrong answer. The derivation reads
@@ -924,6 +939,7 @@ export function queueRoutes(): Hono {
           getRow: (qitemId) => repo.getById(qitemId) ?? null,
           continuationOf: (qitemId) => repo.currentParkContinuation(qitemId),
         },
+        missionsRoot,
       );
       return c.json({ ...position, ...derived, role,
         // heldAndNextTruncated stays for trace scripts that predate the per-list flags.
