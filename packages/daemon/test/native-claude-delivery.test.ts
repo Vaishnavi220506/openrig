@@ -126,6 +126,7 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
     const expectedSend = [
       "npm-name", "versioned", "pane-command-unavailable", "unknown-both", "versioned-direct-pane",
       "missing-token", "unavailable", "background", "other-semver", "missing-metadata",
+      "ambiguous-pane",
       "versioned-argv-only", "versioned-comm-only", "launcher-shim",
       "launcher-shim-match", "launcher-shim-match-after", "launcher-shim-child-unparsed",
       "launcher-shim-child-two-sessions", "settings-single",

@@ -3244,20 +3244,29 @@ export class SessionTransport {
     const unknown = { state: "unknown" as const, detail: "Claude runtime observation or older launch binding is unavailable" };
     try {
       const panes = await this.tmuxAdapter.listPanes(sessionName);
-      if (panes.length > 1 || (pane && panes.length === 1 && panes[0]!.id !== pane)) {
-        return { state: "conflict", detail: "The session does not have the single expected bound pane" };
+      if (panes.length > 0 && pane && !panes.some(candidate => candidate.id === pane)) {
+        return { state: "conflict", detail: "The session does not have the expected bound pane" };
       }
       if (!pane || panes.length === 0) return unknown;
-      const [sessionPid, panePid] = await Promise.all([this.tmuxAdapter.getPanePid(sessionName), this.tmuxAdapter.getPanePid(pane)]);
-      if (sessionPid && panePid && sessionPid !== panePid) return { state: "conflict", detail: "The session and bound pane name different processes" };
+      let panePid: number | null;
+      if (panes.length === 1) {
+        const [sessionPid, observedPanePid] = await Promise.all([this.tmuxAdapter.getPanePid(sessionName), this.tmuxAdapter.getPanePid(pane)]);
+        if (sessionPid && observedPanePid && sessionPid !== observedPanePid) return { state: "conflict", detail: "The session and bound pane name different processes" };
+        panePid = observedPanePid;
+      } else {
+        // A session target resolves to its current pane, which may be a sibling
+        // panel. With more than one pane, the immutable bound pane is the only
+        // process identity that can be compared safely.
+        panePid = await this.tmuxAdapter.getPanePid(pane);
+      }
       const observation = await observeClaudeDelivery({ target: pane, tmux: this.tmuxAdapter, listProcesses: this.listProcesses, expectedToken: resumeToken, rotation });
       // Refusal already has positive evidence; a later failed read cannot erase it.
       if (observation.state === "conflict" || observation.state === "idle_shell") return observation;
       const after = await this.tmuxAdapter.listPanes(sessionName);
-      if (after.length > 1 || (after.length === 1 && after[0]!.id !== pane)) return { state: "conflict", detail: "The bound pane changed during delivery verification" };
+      if (after.length > 0 && !after.some(candidate => candidate.id === pane)) return { state: "conflict", detail: "The bound pane changed during delivery verification" };
       const currentPid = await this.tmuxAdapter.getPanePid(pane);
       if (panePid && currentPid && panePid !== currentPid) return { state: "conflict", detail: "The bound pane process changed during delivery verification" };
-      return after.length === 0 || !sessionPid || !panePid || !currentPid ? unknown : observation;
+      return !panePid || !currentPid ? unknown : observation;
     } catch { return unknown; }
   }
 
