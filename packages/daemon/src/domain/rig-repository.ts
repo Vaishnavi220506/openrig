@@ -77,22 +77,82 @@ function isStoredStartupBlock(value: unknown): boolean {
     return actionTypes.includes(String(entry.type))
       && typeof entry.value === "string"
       && actionPhases.includes(String(entry.phase))
-      && typeof entry.idempotent === "boolean";
+      && Array.isArray(entry.appliesOn)
+      && entry.appliesOn.every((phase) => phases.includes(String(phase)))
+      && typeof entry.idempotent === "boolean"
+      && (entry.builtin === undefined || entry.builtin === "session_identity");
   });
+}
+
+function isStoredContinuityPolicy(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Record<string, unknown>;
+  if (typeof policy.enabled !== "boolean") return false;
+  if (policy.syncTriggers !== undefined
+    && (!Array.isArray(policy.syncTriggers) || !policy.syncTriggers.every((entry) => typeof entry === "string"))) return false;
+  for (const field of ["artifacts", "restoreProtocol"] as const) {
+    const nested = policy[field];
+    if (nested !== undefined) {
+      if (nested === null || typeof nested !== "object" || Array.isArray(nested)) return false;
+      if (!Object.values(nested as Record<string, unknown>).every((entry) => typeof entry === "boolean")) return false;
+    }
+  }
+  return true;
+}
+
+function isStoredWorkspace(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const workspace = value as Record<string, unknown>;
+  if (typeof workspace.workspaceRoot !== "string" || !Array.isArray(workspace.repos)) return false;
+  if (workspace.defaultRepo !== undefined && typeof workspace.defaultRepo !== "string") return false;
+  if (workspace.knowledgeRoot !== undefined && typeof workspace.knowledgeRoot !== "string") return false;
+  return workspace.repos.every((repo) => {
+    if (repo === null || typeof repo !== "object" || Array.isArray(repo)) return false;
+    const entry = repo as Record<string, unknown>;
+    return typeof entry.name === "string" && typeof entry.path === "string" && typeof entry.kind === "string";
+  });
+}
+
+function isStoredServices(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const services = value as Record<string, unknown>;
+  if (services.kind !== "compose" || typeof services.composeFile !== "string") return false;
+  if (services.projectName !== undefined && typeof services.projectName !== "string") return false;
+  if (services.profiles !== undefined
+    && (!Array.isArray(services.profiles) || !services.profiles.every((entry) => typeof entry === "string"))) return false;
+  if (services.downPolicy !== undefined
+    && !["leave_running", "down", "down_and_volumes"].includes(String(services.downPolicy))) return false;
+  if (services.waitFor !== undefined && !Array.isArray(services.waitFor)) return false;
+  if (services.surfaces !== undefined
+    && (services.surfaces === null || typeof services.surfaces !== "object" || Array.isArray(services.surfaces))) return false;
+  if (services.checkpoints !== undefined && !Array.isArray(services.checkpoints)) return false;
+  return true;
 }
 
 function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const spec = value as Record<string, unknown>;
   if (typeof spec.version !== "string" || typeof spec.name !== "string" || !Array.isArray(spec.pods)) return false;
+  if (spec.cultureFile !== undefined && typeof spec.cultureFile !== "string") return false;
   if (spec.nonInterruptive !== undefined && typeof spec.nonInterruptive !== "boolean") return false;
   if (spec.permissionPolicy !== undefined && typeof spec.permissionPolicy !== "string") return false;
   if (spec.env !== undefined && !isStringRecord(spec.env)) return false;
+  if (spec.managedBlocks !== undefined) {
+    if (spec.managedBlocks === null || typeof spec.managedBlocks !== "object" || Array.isArray(spec.managedBlocks)) return false;
+    const managedBlocks = spec.managedBlocks as Record<string, unknown>;
+    if (managedBlocks["claude-code"] !== undefined
+      && !["CLAUDE.md", "CLAUDE.local.md"].includes(String(managedBlocks["claude-code"]))) return false;
+  }
   if (spec.startup !== undefined && !isStoredStartupBlock(spec.startup)) return false;
+  if (spec.services !== undefined && !isStoredServices(spec.services)) return false;
+  if (spec.workspace !== undefined && !isStoredWorkspace(spec.workspace)) return false;
   return spec.pods.every((pod) => {
     if (pod === null || typeof pod !== "object" || Array.isArray(pod)) return false;
     const candidate = pod as Record<string, unknown>;
-    if (typeof candidate.id !== "string" || typeof candidate.label !== "string" || !Array.isArray(candidate.members)) return false;
+    if (typeof candidate.id !== "string" || typeof candidate.label !== "string"
+      || !Array.isArray(candidate.members) || candidate.members.length === 0) return false;
+    if (candidate.continuityPolicy !== undefined && !isStoredContinuityPolicy(candidate.continuityPolicy)) return false;
+    if (candidate.startup !== undefined && !isStoredStartupBlock(candidate.startup)) return false;
     return candidate.members.every((member) => {
       if (member === null || typeof member !== "object" || Array.isArray(member)) return false;
       const entry = member as Record<string, unknown>;

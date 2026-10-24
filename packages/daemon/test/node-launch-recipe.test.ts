@@ -71,6 +71,8 @@ describe("persisted pod-aware launch recipes", () => {
       model: "saved-model",
       effort: "saved-effort",
       codexConfigProfile: "saved-profile",
+      permissionPolicy: "builtin:team",
+      env: { SAVED_CHOICE: "yes" },
       cwd: "/saved/cwd",
       podId: "pod-saved-choice",
       launchRecipe: {
@@ -107,6 +109,8 @@ describe("persisted pod-aware launch recipes", () => {
       model: "saved-model",
       effort: "saved-effort",
       codexConfigProfile: "saved-profile",
+      permissionPolicy: "builtin:team",
+      env: { SAVED_CHOICE: "yes" },
       cwd: "/saved/cwd",
     }));
   });
@@ -120,6 +124,89 @@ describe("persisted pod-aware launch recipes", () => {
       .run(JSON.stringify({ version: 1, rigRoot: "/workspace", rigSpec: { version: "0.2", name: "broken", pods: {} } }), node.id);
 
     expect(setup.rigRepo.getNodeLaunchRecipe(node.id)).toBeNull();
+  });
+
+  it.each([
+    { label: "invalid JSON", value: "{" },
+    {
+      label: "missing member",
+      value: {
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "broken",
+          pods: [{ id: "dev", label: "Dev", members: [], edges: [] }],
+          edges: [],
+        },
+      },
+    },
+    {
+      label: "malformed startup action",
+      value: {
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "broken",
+          startup: {
+            files: [],
+            actions: [{ type: "send_text", value: "hello", phase: "after_ready", idempotent: true, appliesOn: "fresh_start" }],
+          },
+          pods: [{ id: "dev", label: "Dev", members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
+          edges: [],
+        },
+      },
+    },
+    {
+      label: "malformed pod continuity policy",
+      value: {
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "broken",
+          pods: [{ id: "dev", label: "Dev", continuityPolicy: { enabled: "yes" }, members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
+          edges: [],
+        },
+      },
+    },
+    {
+      label: "malformed rig metadata",
+      value: {
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "broken",
+          cultureFile: 42,
+          managedBlocks: { "claude-code": {} },
+          services: { kind: "compose", composeFile: 42 },
+          workspace: { workspaceRoot: "/workspace", repos: "not-an-array" },
+          pods: [{ id: "dev", label: "Dev", members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
+          edges: [],
+        },
+      },
+    },
+  ])("rejects $label without throwing", ({ value }) => {
+    db = createFullTestDb();
+    const setup = createTestApp(db);
+    const rig = setup.rigRepo.createRig("malformed-shape-rig");
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex" });
+    db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+      .run(typeof value === "string" ? value : JSON.stringify(value), node.id);
+
+    expect(setup.rigRepo.getNodeLaunchRecipe(node.id)).toBeNull();
+  });
+
+  it("returns no recipe for a node that has never been materialized", () => {
+    db = createFullTestDb();
+    const setup = createTestApp(db);
+    const rig = setup.rigRepo.createRig("unmaterialized-rig");
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex" });
+
+    expect(setup.rigRepo.getNodeLaunchRecipe(node.id)).toBeNull();
+    expect(setup.podInstantiator.canLaunchPersistedFresh(rig.id, node.id)).toBe(false);
   });
 
   it("restores through the real restore-to-instantiator callback with a fresh instantiator", async () => {
