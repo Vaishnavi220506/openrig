@@ -161,6 +161,7 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   const withTerminalAndWork = attachTerminalActivityAndWork(withActivity, {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   // Slice 13 fix 2 — HOST ATTRIBUTION AT THE SOURCE. A daemon only inventories its own seats, so
   // every row it serves lives on THIS host; stamping the boot-reconciled self-id here means a
@@ -195,8 +196,12 @@ nodesRoutes.get("/:logicalId", async (c) => {
   const [detailWithTerminalAndWork] = attachTerminalActivityAndWork(detailWithActivity ? [detailWithActivity] : [detail], {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   Object.assign(detail, {
+    needsAttention: detailWithTerminalAndWork?.needsAttention,
+    arbitratedNeedsInput: detailWithTerminalAndWork?.arbitratedNeedsInput,
+    needsInputEvidence: detailWithTerminalAndWork?.needsInputEvidence,
     agentActivity: detailWithTerminalAndWork?.agentActivity,
     terminalActive: detailWithTerminalAndWork?.terminalActive,
     // ARCH RULING 3a947fb1: serve the raw lastActivityAt fact on node-detail too
@@ -581,6 +586,35 @@ sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c
   }
 
   return c.json(outcome, 200);
+});
+
+// Deliberately separate from /reconcile: old daemons must return 404, never adopt.
+sessionAdminRoutes.post("/:sessionName/repair-missing-pane", terminalAuthGuard(), async (c) => {
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "Supply a JSON object with optional rigId and logicalId." }, 400);
+  }
+  const input = body as Record<string, unknown>;
+  for (const key of ["rigId", "logicalId"]) {
+    if (input[key] !== undefined && (typeof input[key] !== "string" || !(input[key] as string).trim())) {
+      return c.json({ error: `${key} must be a non-empty string.` }, 400);
+    }
+  }
+  const rigId = input.rigId as string | undefined, logicalId = input.logicalId as string | undefined;
+  if (!!rigId !== !!logicalId) return c.json({ error: "rigId and logicalId must be provided together (or both omitted)." }, 400);
+  const claimService = c.get("claimService" as never) as ClaimService | undefined;
+  const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!claimService || !instantiator) return c.json({ error: "Missing-pane repair is unavailable on this daemon." }, 503);
+  const result = await convergeOp({ instantiator, claimService }, rigId ?? "", {
+    kind: "reconcile_session", sessionName: c.req.param("sessionName")!, rigId, logicalId, repairMissingPane: true,
+  }, ".");
+  if (result.kind !== "reconcile_session" || !result.supported) return c.json({ error: "Unexpected repair result." }, 500);
+  const outcome = result.outcome;
+  if (outcome.ok) return c.json(outcome, 200);
+  if (outcome.code === "tmux_unavailable") return c.json(outcome, 503);
+  if (outcome.code === "repair_timed_out") return c.json(outcome, 504);
+  if (outcome.code === "reconcile_error") return c.json(outcome, 500);
+  return c.json(outcome, 409);
 });
 
 // POST /api/sessions/:sessionName/clear-attention — OPR.0.3.4.10.

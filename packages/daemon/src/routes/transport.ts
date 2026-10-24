@@ -10,7 +10,7 @@ import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
 // Held to the S1 truthfulness bar for a success payload: what happened, what the
 // recipient cannot know, and the concrete fix (sign).
 const UNKNOWN_SENDER_NOTICE =
-  "Delivered without sender identity: this request carried no X-OpenRig-Session header, so your recipient has no way of knowing who sent it. Follow up and sign it — send from a seat shell (the header stamps automatically) or state your identity in the message body.";
+  "Delivered without sender identity: this request carried no X-OpenRig-Session header, so your recipient has no way of knowing who sent it. Follow up and sign it: from a seat shell the header stamps automatically; from anywhere else, send it as a declared sender, `rig queue create --source <you>@external --destination <seat> --summary \"<one line>\" --body-file <file>` (recorded as declared; a registered human gets a reply route), or join this shell to a seat, `eval \"$(rig attach --self --rig <rigId> --node <logicalId> --print-env)\"`, so its sends carry that seat's name (`rig attach --help` covers adding a new member).";
 
 // The unknown-sender From: marker, DERIVED from the canonical envelope wrapper
 // (pane-envelope.ts SENDER_FALLBACK is unexported and its literal is
@@ -35,11 +35,15 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       force?: boolean;
       waitForIdleMs?: number;
       dangerouslyInteract?: boolean;
+      typeWithoutChecking?: boolean;
       reason?: string;
       actorSession?: string | null;
       submitOnly?: boolean;
       expectedStagedText?: string;
       expectedStagedLineCount?: number;
+      /** The unwrapped text; typed instead of `text` when the recipient is a terminal seat. */
+      exactText?: string;
+      urgent?: boolean;
     }>();
 
     // submitOnly (mechanics-gate fix d9b3989a) sends NO text — the Enter-only retry for staged
@@ -88,6 +92,8 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     // the 401 only ever stopped honest uncounted callers. Instead the send DELIVERS, the
     // already-nullable audit actor records null (projected "unknown"), and the response carries
     // the sign-it notice below.
+    if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
+      error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
     const derivedActor = transportSenderSession(c) ?? null;
 
     // Check for ambiguity first
@@ -97,27 +103,39 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       return c.json({ ok: false, error: resolved.error }, status);
     }
 
+    const exactText = typeof body.exactText === "string" ? body.exactText : undefined;
     const result = await transport.send(body.session, body.text ?? "", {
       deliveryId: body.deliveryId,
       verify: body.verify,
       force: body.force,
       waitForIdleMs: body.waitForIdleMs,
       dangerouslyInteract: body.dangerouslyInteract,
+      typeWithoutChecking: body.typeWithoutChecking,
       reason: body.reason,
       actorSession: derivedActor, // transport-derived, never the body claim
       ...(derivedActor ? { identityProvenance: "transport:v1" } : {}),
+      // Anyone may mark a send urgent; who marked it is the transport-derived sender, never a body claim.
+      ...(body.urgent === true ? { urgent: { by: derivedActor ?? "unknown" } } : {}),
       // Mechanics-gate fix (d9b3989a): the walk retry's bare-Enter mode, guarded in the
       // transport by the expected-staged-text precheck.
       submitOnly: body.submitOnly,
       expectedStagedText: body.expectedStagedText,
       expectedStagedLineCount: body.expectedStagedLineCount,
+      exactText,
+      // The caller's request: if it goes away while the send still waits, nothing is typed later.
+      signal: c.req.raw.signal,
     });
 
+    // The seat's own agent typing into its own terminal is told apart where the sender is known: it's treated like any
+    // agent's message, and recorded as its own.
+    const self = !!derivedActor && resolved.sessions.length === 1 && resolved.sessions[0]!.sessionName === derivedActor;
+    if (self) Object.assign(result, { fromDestinationSeat: true });
     if (result.outcome === "retained") return c.json(result);
 
     if (!result.ok) {
       const statusMap: Record<string, number> = {
         typing_guard_enabled: 409,
+        caller_cancelled: 409,
         guard_target_unknown: 409,
         guard_target_changed: 409,
         delivery_identity_conflict: 409,
@@ -125,6 +143,8 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
         delivery_already_attempted: 409,
         delivery_in_progress: 409,
         delivery_indeterminate: 409,
+        override_input_present: 409,
+        override_input_unknown: 409,
         draft_input_busy: 409,
         draft_input_unknown: 409,
         draft_input_changed: 409,
@@ -164,12 +184,14 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
       if (outbox) {
         try {
-          outbox.record({
+          const entry = outbox.record({
             senderSession: derivedActor,
             destinationSession: body.session,
-            body: body.text,
+            body: result.envelopeOmitted && exactText !== undefined ? exactText : body.text,
             identityProvenance: "transport:v1",
           });
+          // The input was dispatched successfully; mark its audit row as broadcast does.
+          outbox.markDelivered(entry.outboxId);
         } catch (err) {
           console.warn(`[transport/send] outbox auto-record failed (send already delivered): ${(err as Error).message}`);
         }
@@ -254,8 +276,10 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       // (the danger audit fires once per seat, not once per batch).
       waitForIdleMs?: number;
       dangerouslyInteract?: boolean;
+      typeWithoutChecking?: boolean;
       reason?: string;
       actorSession?: string | null;
+      urgent?: boolean;
       // OPR.0.4.3.30 — when set, the fan-out wraps each recipient in its own From/To envelope.
       // `rig broadcast` never sets it (raw-to-all, unchanged).
       envelopeSender?: string | null;
@@ -269,6 +293,8 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     // transport header (see /send). An absent header no longer refuses — the send proceeds and the
     // audit's already-nullable actor records null (projected "unknown"); the response carries the
     // sign-it notice below.
+    if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
+      error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
     const derivedActor = transportSenderSession(c) ?? null;
 
     // P21 I4 (orch ruling from specimen 5 — the false "From: pm-lead" the incident acted upon): the
@@ -298,10 +324,14 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       force: body.force,
       waitForIdleMs: body.waitForIdleMs,
       dangerouslyInteract: body.dangerouslyInteract,
+      typeWithoutChecking: body.typeWithoutChecking,
       reason: body.reason,
       actorSession: derivedActor, // transport-derived, never the body claim
+      ...(body.urgent === true ? { urgent: { by: derivedActor ?? "unknown" } } : {}),
       envelopeSender, // the From: is the DERIVED identity (never the body value) — orch ruling (a)
       ...(derivedActor ? { identityProvenance: "transport:v1" } : {}),
+      // Recipients not yet started when the caller goes away are not written; started ones keep their results.
+      signal: c.req.raw.signal,
     });
 
     // A3b (P22 follow-on, planner-ruled IN scope): auto-record the fan-out — N rows, ONE per RESOLVED

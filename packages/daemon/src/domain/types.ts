@@ -34,6 +34,8 @@ export interface Node {
   runtime: string | null;
   model: string | null;
   effort?: string | null;
+  /** Session-scoped Claude Advisor model; never written to shared Claude settings. */
+  advisor?: string | null;
   /** OPR.0.7.0.7: the seat's explicit effort choice (rig seat set-effort); null = none. */
   effortChoice?: string | null;
   codexConfigProfile?: string | null;
@@ -105,8 +107,8 @@ export interface Session {
   origin: "launched" | "claimed";
   startupStatus: "pending" | "ready" | "attention_required" | "failed";
   startupCompletedAt: string | null;
-  /** The community agent app this session was launched for (selected through its preset); absent otherwise. */
-  agentApp?: string;
+  /** The community harness this session was launched for (selected through its preset); absent otherwise. */
+  communityHarness?: string;
 }
 
 // -- Event types --
@@ -126,6 +128,8 @@ export type RigEvent =
       pinnedModel: string;
       effectiveModel: string;
       diagnosis: string | null;
+      /** Absent on events written before this field existed. When present, a restarted daemon doesn't proclaim it again. */
+      occurrenceId?: string;
       channels: Array<{ channel: string; target: string | null; status: string; detail?: string }>;
     }
   | { type: "rig.deleted"; rigId: string }
@@ -136,9 +140,10 @@ export type RigEvent =
   | { type: "session.detached"; rigId: string; nodeId: string; sessionName: string }
   // S5 (OPR.0.5.4.7) — seat-lifecycle audit trail: the three supported seat verbs each persist
   // their mutation with actor + reason in the same transaction as the mutation itself.
-  | { type: "node.model_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }
+  | { type: "node.terminal_policy_changed"; rigId: string; nodeId: string; scope: "seat" | "rig_default"; config: unknown; actor: string; reason: string }
+  | { type: "node.model_changed"; actorClass?: string; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }
   | { type: "node.cwd_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }
-  | { type: "node.effort_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string | null; reason: string; operator: string | null }
+  | { type: "node.effort_changed"; actorClass?: string; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string | null; reason: string; operator: string | null }
   | { type: "node.permissions_changed"; rigId: string; nodeId: string; from: unknown; to: unknown; actor: string; reason: string; source: "seat_selection"; effect: "future_launches_only" }
   | { type: "node.policy_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; launchPosture: "floor" | "full_bypass" | "auto"; reason: string; operator: string }
   | { type: "session.stopped"; rigId: string; nodeId: string; sessionName: string; reason: string; operator: string | null }
@@ -148,9 +153,9 @@ export type RigEvent =
   // OPR.0.7.0.5 — in-place restart (same conversation, same pane). Started is persisted before any signal, so
   // a request that waited behind it, or a restart that never recorded a result, is refused rather than repeated.
   | { type: "seat.restart_in_place_started"; rigId: string; nodeId: string; logicalId: string; sessionName: string; pane: string; paneShape: "shell_backed" | "direct_native"; oldPid: number; oldStartedAt: string | null; codexHome: string; reason: string; operator: string | null }
-  | { type: "seat.restart_in_place_finished"; rigId: string; nodeId: string; logicalId: string; sessionName: string; outcome: "restarted_account_unverified" | "not_started" | "incomplete" | "native_unknown"; newPid: number | null; newStartedAt: string | null; codexHome: string; paneHeld: boolean; accountLinesAtRestart: Record<string, number> | null; finishedAt: string }
-  | { type: "seat.fresh_launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string; nativeSessionId: string | null; nativeSessionIdReason?: string; model: string | null; effort?: string | null; startupPolicyHash: string; reason: string; operator: string | null; status: "ready" | "attention_required" }
-  | { type: "seat.fresh_launch_failed"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string | null; model: string | null; effort?: string | null; startupPolicyHash: string; reason: string; operator: string | null; errors: string[] }
+  | { type: "seat.restart_in_place_finished"; rigId: string; nodeId: string; logicalId: string; sessionName: string; outcome: "restarted_account_unverified" | "not_started" | "incomplete" | "native_unknown"; newPid: number | null; newStartedAt: string | null; codexHome: string; paneHeld: boolean; accountLinesAtRestart?: Record<string, number> | null; accountTextAtRestart?: { anchor: string[]; counts: Record<string, number> } | null; finishedAt: string }
+  | { type: "seat.fresh_launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string; nativeSessionId: string | null; nativeSessionIdReason?: string; model: string | null; effort?: string | null; advisor?: string | null; startupPolicyHash: string; reason: string; operator: string | null; status: "ready" | "attention_required" }
+  | { type: "seat.fresh_launch_failed"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string | null; model: string | null; effort?: string | null; advisor?: string | null; startupPolicyHash: string; reason: string; operator: string | null; errors: string[] }
   | { type: "snapshot.created"; rigId: string; snapshotId: string; kind: string }
   | { type: "restore.started"; rigId: string; snapshotId: string; snapshotSelection?: RestoreSnapshotSelection; intendedRoster?: Array<{ nodeId: string; logicalId: string }>; excludedNodes?: RestoreExcludedNode[] }
   | { type: "restore.completed"; rigId: string; snapshotId: string; result: RestoreResult }
@@ -165,7 +170,7 @@ export type RigEvent =
   // OPR.0.4.1.10 — audit record for a --dangerously-interact send that drove a target's interactive
   // prompt / permission block. overrideReason = caller's --reason; detectedReason/evidenceSource =
   // what the classifier saw (kept distinct so permission_prompt vs selection_prompt vs unknown stays visible).
-  | { type: "transport.prompt_override"; rigId: string; nodeId: string; sessionName: string; actorSession: string | null; detectedState: string; detectedReason: string; evidenceSource: string; overrideReason: string | null }
+  | { type: "transport.prompt_override"; rigId: string; nodeId: string; sessionName: string; actorSession: string | null; detectedState: string; detectedReason: string; evidenceSource: string; overrideReason: string | null; input?: { classification: string; visibleRows: number; suggestionRows: number; choice: "inspect" | "type_without_checking"; outcome: "stopped" | "proceed"; clearAttempted: false } }
   // OPR.0.4.6.PI1 FR-5 — "rpc" provenance is ADDITIVE: Pi session identity comes
   // from the pi-runner's RPC get_state / typed events, never pane scraping.
   | { type: "agent.session_identity"; rigId: string; nodeId: string; sessionName: string; runtime: string; sessionId: string; provenance: "hook" | "scrape" | "rpc" }
@@ -189,6 +194,7 @@ export type RigEvent =
   // 2026-07-02 founder ruling).
   | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "process_unreadable" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
   | { type: "seat.attention_cleared"; rigId: string; nodeId: string; sessionName: string; from: string; to: "ready"; clearedBy: "evidence" | "operator_attestation"; evidence?: { kind: string; state?: string; reason?: string }; reason?: string; previousError: string | null }
+  | { type: "seat.attention_clear_refused"; rigId: string; nodeId: string; sessionId: string; sessionName: string; attentionClass: "restore_outcome"; code: string; attemptId?: number; probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   | { type: "rig.imported"; rigId: string; specName: string; specVersion: string }
   // Package events (cross-rig, no rigId)
   | { type: "package.validated"; packageName: string; valid: boolean }
@@ -219,8 +225,6 @@ export type RigEvent =
         | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string } }
   // Bundle events (cross-rig)
   | { type: "bundle.created"; bundleName: string; bundleVersion: string; archiveHash: string }
-  // OPR.0.7.0.18 — a subscription move an agent made or attempted, as it reported it (fleet-wide, no rig).
-  | { type: "subscription.move_recorded"; move: import("./provider/subscription-moves.js").SubscriptionMoveEventPayload }
   // Teardown events
   | { type: "rig.stopped"; rigId: string }
   // OPR.0.3.3.19 - rig archive affordance (soft, reversible; NOT a delete)
@@ -231,7 +235,7 @@ export type RigEvent =
   | { type: "pod.deleted"; rigId: string; podId: string }
   | { type: "node.startup_pending"; rigId: string; nodeId: string; startupProof?: StartupProofSelection }
   | { type: "node.startup_ready"; rigId: string; nodeId: string; previousStatus?: "failed" | "attention_required"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
-  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; forkContextPending?: { parentToken: string; isRestore: boolean }; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null }
+  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; forkContextPending?: { parentToken: string; isRestore: boolean }; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null; probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   // OPR.0.4.3.06 — startup proof (challenge-verified orientation). Append-only.
   // `node.startup_challenged` freezes this launch's challenge ground truth
   // (challengeId + contractHash; the expected answer is recomputed, never
@@ -297,6 +301,7 @@ export type RigEvent =
   | { type: "watchdog.evaluation_terminal"; jobId: string; policy: string; terminalReason: string }
   | { type: "watchdog.job_registered"; jobId: string; policy: string; targetSession: string; registeredBy: string }
   | { type: "watchdog.job_stopped"; jobId: string; reason: string }
+  | { type: "watchdog.job_updated"; jobId: string; changed: string[] }
   // PL-004 Phase D: daemon-native Workflow Runtime events. Step closure
   // and next-qitem projection are emitted within the SAME daemon
   // transaction (transactional-scribe contract). Subscribers see the
@@ -486,8 +491,9 @@ export interface RestoreNodeResult {
   // `failed` (genuine harness error only). `awaiting-decision` is never
   // emitted while a session is live. (`fresh` is retained for the legacy
   // continuity-restoring skip path only; `rebuilt`/`operator_recovered` sit
-  // outside the five-term split.)
-  status: "resumed" | "rebuilt" | "fresh" | "fresh-primed" | "awaiting-decision" | "failed" | "attention_required" | "operator_recovered";
+  // outside the five-term split.) `left_attached`: a seat joined with `rig attach` as an external CLI, which
+  // restore leaves as it is; nothing was launched, and OpenRig can't see whether that app still runs.
+  status: "resumed" | "rebuilt" | "fresh" | "fresh-primed" | "awaiting-decision" | "failed" | "attention_required" | "operator_recovered" | "left_attached";
   error?: string;
   /** Pane evidence captured when status is `attention_required` (L3, optional). */
   attentionEvidence?: string | null;
@@ -549,6 +555,10 @@ export interface AgentActivity {
   sampledAt: string;
   evidence: string | null;
   eventAt?: string | null;
+  /** The emitter's own order for its posts (OpenRig's pi/omp runner), when it sent one. */
+  sourceSequence?: number | null;
+  /** How often the emitter promises to report while idle; an idle report older than two of these no longer holds. */
+  livenessSeconds?: number | null;
   rawEvent?: string | null;
   rawSubtype?: string | null;
   runtime?: string | null;
@@ -592,7 +602,7 @@ export type NodeLifecycleState = "running" | "detached" | "recoverable" | "atten
  * projection; `verified`, `binding_absent`, and `tmux_unavailable` (and an
  * absent verdict) leave it unchanged.
  */
-/** `unconfirmed`: the seat's pane is live, but nothing proves which session it runs (a community agent app). */
+/** `unconfirmed`: the seat's pane is live, but nothing proves which session it runs (a community harness). */
 export type SeatIdentityVerdictKind = "verified" | "unconfirmed" | "mismatch" | "pane_missing" | "binding_absent" | "tmux_unavailable";
 
 export interface SeatIdentityVerdict {
@@ -613,7 +623,10 @@ export interface SeatIdentityVerdict {
     | null;
   evidence: {
     registeredPane: string | null;
+    /** PID of the matched process (a native child for wrapper launches). */
     observedPid: number | null;
+    /** Pane root observed in the same verdict; absent on legacy verdicts. */
+    observedPanePid?: number | null;
     observedCommand: string | null;
     matchedLayer: number | null;
   };
@@ -665,8 +678,8 @@ export interface NodeInventoryEntry {
   attachmentType?: "tmux" | "external_cli" | null;
   nodeKind: "agent" | "infrastructure";
   runtime: string | null;
-  /** Present only on a community agent app's seat: its label, maintainer and declared limits. */
-  agentApp?: import("./agent-app-presets.js").AgentAppLabel;
+  /** Present only on a community harness's seat: its label, maintainer and declared limits. */
+  communityHarness?: import("./community-harness-presets.js").CommunityHarnessLabel;
   /** Effective current status; confirmed session absence projects as detached. */
   sessionStatus: string | null;
   /** Persisted session status, retained for history and registry-based rollups. */
@@ -695,6 +708,11 @@ export interface NodeInventoryEntry {
   latestError: string | null;
   // Extended fields
   model: string | null;
+  /** The effort a managed launch sends: the seat's explicit choice, else the authored value.
+   *  null = no configured value (the runtime's own default). Never a guess at what the model ran. */
+  effort: string | null;
+  /** Where `effort` came from. `runtime_default` means no configured level is known. */
+  effortSource: "seat_choice" | "authored" | "runtime_default";
   agentRef: string | null;
   profile: string | null;
   codexConfigProfile?: string | null;
@@ -708,6 +726,12 @@ export interface NodeInventoryEntry {
   resumeType: string | null;
   resumeToken: string | null;
   startupCompletedAt: string | null;
+  /** The daemon's attention predicate, also used by the rig attention total. */
+  needsAttention?: boolean;
+  /** true = observed input; false = observed clear; null = no authoritative needs-input answer.
+   * Absent only on inventory that has not been enriched. Never infer false from a zero count. */
+  arbitratedNeedsInput?: boolean | null;
+  needsInputEvidence?: import("./activity-taxonomy.js").ArbitratedSeatState["needsInputEvidence"];
   agentActivity?: AgentActivity;
   contextUsage?: ContextUsage;
   /** Health of the daemon-owned transcript capture for this seat. */
@@ -867,7 +891,10 @@ export interface NodeDetailEntry extends NodeInventoryEntry {
   binding: Binding | null;
   startupFiles: Array<{ path: string; deliveryHint: string; required: boolean }>;
   startupActions: Array<{ type: string; value: string }>;
-  installedResources: Array<{ id: string; category: string; targetPath: string }>;
+  /** `targetPath` is where a resource is known to be installed, or "" when that isn't shown. For guidance, it is the
+   *  file the runtime merges into, and only while that file holds a complete block with this id; `declaredTarget` is the spec's `target`
+   *  (parsed, never used to write), and `effectiveTarget` the file the runtime would merge into. */
+  installedResources: Array<{ id: string; category: string; targetPath: string; declaredTarget?: string; effectiveTarget?: string }>;
   recentEvents: Array<{ type: string; createdAt: string; payload: Record<string, unknown> }>;
   infrastructureStartupCommand: string | null;
   peers: NodeDetailPeer[];
@@ -929,6 +956,7 @@ export type StartupFailureStage =
   | "after_files"
   | "after_ready"
   | "post_delivery_readiness"
+  | "assisted_startup"
   | "identity_verification";
 
 export interface LifecycleDefaults {
@@ -968,7 +996,7 @@ export interface AgentResources {
 
 export interface ProfileSpec {
   summary?: string;
-  preferences?: { runtime?: string; model?: string; effort?: string };
+  preferences?: { runtime?: string; model?: string; effort?: string; advisor?: string };
   startup?: StartupBlock;
   lifecycle?: LifecycleDefaults;
   uses: {
@@ -999,6 +1027,7 @@ export interface AgentSpec {
     runtime?: string;
     model?: string;
     effort?: string;
+    advisor?: string;
     lifecycle?: LifecycleDefaults;
   };
   startup: StartupBlock;
@@ -1023,6 +1052,7 @@ export interface LegacyRigSpecNode {
   role?: string;
   model?: string;
   effort?: string;
+  advisor?: string;
   cwd?: string;
   surfaceHint?: string;
   workspace?: string;
@@ -1130,6 +1160,7 @@ export interface RigSpecPodMember {
   codexConfigProfile?: string;
   model?: string;
   effort?: string;
+  advisor?: string;
   /**
    * OPR.0.4.6.FAC1: optional seat-side role declaration (writes the
    * existing `nodes.role` column via createMemberNode → addNode). The
@@ -1141,6 +1172,11 @@ export interface RigSpecPodMember {
   /** OPR.0.4.8.3 Seam B: optional per-seat permission_policy REF (builtin:<name> or a spec-relative
    *  custom path). Absent = the floor. Overrides the rig-level ref. */
   permissionPolicy?: string;
+  /** OPR.0.7.0.9 — Claude members only: their own agent file, appended system prompt file and plugin folders,
+   *  as paths beside the spec. Copied into the seat's own storage at launch. */
+  agentFile?: string;
+  appendSystemPromptFile?: string;
+  pluginDirs?: string[];
   /** Non-secret launch environment for this seat; overrides the rig-level `env`. */
   env?: Record<string, string>;
   cwd: string;

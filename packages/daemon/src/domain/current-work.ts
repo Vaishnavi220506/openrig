@@ -101,6 +101,7 @@ export function deriveRole(db: Database.Database | undefined, nodeId: string | n
 
 const MISSION_TAG = "mission:";
 const SLICE_TAG = "slice:";
+const PROJECT_TAG = "project:";
 
 type MatchForm = "directory name" | "frontmatter id";
 
@@ -378,6 +379,8 @@ export function deriveCurrentWork(
 export interface WorkCandidate {
   kind: "tag" | "ancestry";
   qitemId: string | null;
+  /** The `project:` tags on the row the mission came from (the ancestor, for ancestry), sorted. */
+  projects: string[];
   mission: string;
   slice: string | null;
   /** The slice node when the slice resolves, else the mission node; null when the mission does not. */
@@ -505,7 +508,7 @@ export function deriveWorkCandidates(
   const held: WorkCandidates["held"] = [];
   const seen = new Set<string>();
   const add = (candidate: WorkCandidate) => {
-    const key = `${candidate.kind}|${candidate.mission}|${candidate.slice ?? ""}|${candidate.workNodePath ?? ""}`;
+    const key = `${candidate.kind}|${candidate.projects.join(",")}|${candidate.mission}|${candidate.slice ?? ""}|${candidate.workNodePath ?? ""}`;
     if (seen.has(key)) return;
     seen.add(key);
     candidates.push(candidate);
@@ -532,13 +535,13 @@ export function deriveWorkCandidates(
       // One slice tag belongs to its mission; anything else is shown without a slice rather
       // than paired by array position.
       const slice = missions.length === 1 && slices.length === 1 ? slices[0]! : null;
+      const projects = tagValues(tags, PROJECT_TAG).sort();
       for (const mission of [...missions].sort()) {
         const root = resolveMissionsRoot(missionsRoot, row);
         const resolved = resolveTagged(root.root, mission, slice);
-        add({ kind: "tag", qitemId, mission, slice,
+        add({ kind: "tag", qitemId, projects, mission, slice,
           ...resolved,
-          unresolved: [root.reason, resolved.unresolved].filter(Boolean).join("; ") || null,
-          source: `tag mission:${mission}${slice ? ` + slice:${slice}` : ""} on ${rowLabel(qitemId)}` });
+          source: `tag mission:${mission}${slice ? ` + slice:${slice}` : ""} on ${rowLabel(qitemId)}${root.reason ? `; ${root.reason}` : ""}` });
       }
       continue;
     }
@@ -567,13 +570,13 @@ export function deriveWorkCandidates(
         found = true;
         break;
       }
+      const ancestorProjects = tagValues(ancestor.tags ?? [], PROJECT_TAG).sort();
       for (const mission of [...ancestorMissions].sort()) {
         const root = resolveMissionsRoot(missionsRoot, ancestor);
         const resolved = resolveTagged(root.root, mission, null);
-        add({ kind: "ancestry", qitemId, mission, slice: null,
+        add({ kind: "ancestry", qitemId, projects: ancestorProjects, mission, slice: null,
           ...resolved,
-          unresolved: [root.reason, resolved.unresolved].filter(Boolean).join("; ") || null,
-          source: `handoff ancestor ${ancestorId} carries mission:${mission}; ${rowLabel(qitemId)} itself is untagged` });
+          source: `handoff ancestor ${ancestorId} carries mission:${mission}; ${rowLabel(qitemId)} itself is untagged${root.reason ? `; ${root.reason}` : ""}` });
       }
       found = true;
       break;
@@ -584,4 +587,37 @@ export function deriveWorkCandidates(
   const listed = listMissions(defaultMissionsRoot);
   return { missionsRoot: defaultMissionsRoot, candidates, unknown, next, held,
     missionsOnHost: listed.names, missionsOnHostTruncated: listed.truncated };
+}
+
+/**
+ * What plain `queue whoami` shows when the strict derivation names no current work but the
+ * seat holds in-progress rows: every candidate those rows point at, each with its project,
+ * mission, slice, folder and source row, and an instruction to choose. Nothing here picks one;
+ * the agent does. A count alone ("2 distinct typed work nodes") is not enough to choose from.
+ * Null when there is nothing to choose between: a settled current work node, or no
+ * in-progress rows.
+ */
+export interface CurrentWorkChoice {
+  instruction: string;
+  candidates: WorkCandidate[];
+  /** In-progress rows whose work the queue cannot name. */
+  unknown: WorkCandidates["unknown"];
+}
+
+export const CURRENT_WORK_CHOICE_INSTRUCTION =
+  "OpenRig did not choose your current work. Choose the candidate your actual work belongs to; " +
+  "each names its project, mission, slice, folder and the row it came from (rig queue show <qitemId>).";
+
+export function deriveCurrentWorkChoice(
+  derivation: CurrentWorkDerivation,
+  rows: CandidateRow[],
+  missionsRoot: MissionsRootResolver,
+  lookups: WorkCandidateLookups,
+  defaultMissionsRoot: string | null = typeof missionsRoot === "string" ? missionsRoot : null,
+): CurrentWorkChoice | null {
+  if (derivation.currentWork) return null;
+  const inProgress = rows.filter((row) => row.state === "in-progress");
+  if (inProgress.length === 0) return null;
+  const { candidates, unknown } = deriveWorkCandidates(inProgress, missionsRoot, lookups, defaultMissionsRoot);
+  return { instruction: CURRENT_WORK_CHOICE_INSTRUCTION, candidates, unknown };
 }

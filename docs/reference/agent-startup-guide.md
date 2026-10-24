@@ -321,6 +321,12 @@ not the destination's file contents.)
 - `rig seat launch <seat> --fresh --stop --reason <text>`, which starts a blank conversation; or
 - `rig handover <seat> --source rebuild --reason <text>`, which carries durable context.
 
+For Codex rebuilds, OpenRig also carries a complete supported native permission policy read from the live
+predecessor's own conversation and process, without adding fresh-launch grants. A later recorded seat permission
+or policy choice, or a differing declared successor profile, takes precedence. Missing, stale or unsupported observations keep the existing launch
+behaviour and are reported as unverified in the handover result; requested modes and profiles alone don't prove
+preservation. The result reports what was emitted, not native successor equivalence.
+
 **Adopt it promptly.** The saved directory doesn't move the running process, but background work can use it before
 adoption. Saved configuration isn't the live process's directory, and these examples aren't the only consumers. For a
 running Claude seat:
@@ -517,6 +523,46 @@ remain shared.
 
 **Terminal seats** (`builtin:terminal`) get no agent or profile layers and no startup proof.
 
+### Claude compaction preparation directory
+
+Managed Claude compaction asks the seat to write a restore map before `/compact`. By default,
+OpenRig uses `<cwd>/.openrig/compaction/preparation/`, falling back to its instance home when
+that directory cannot be prepared. A filesystem write check cannot establish whether Claude's
+file-edit permissions allow the seat to write there.
+
+If the launch workspace is denied by Claude's permissions, select an absolute preparation root:
+
+```sh
+rig config set policies.claude_compaction.preparation_root /absolute/path/to/restore-maps
+```
+
+Grant the seat file-edit access to that root in its Claude configuration. OpenRig does not change
+Claude permissions; choose a directory outside any matching deny rule. The corresponding environment
+variable is `OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT`.
+
+New manual and automatic attempts use `<root>/<session>/<attempt-id>/RESTORE-MAP.md`; an in-flight
+attempt keeps its original path through the post-compaction restore request. The root gets an
+exclusive `.gitignore` containing `*`, and the daemon publishes the marked `.tmp` file with an
+atomic rename. Use a dedicated root: a conflicting
+ignore file or an unwritable configured directory stops preparation with
+`preparation_directory_unavailable`, visible in `rig compact <session> --state`, without choosing
+another location. Fix the directory and explicitly retry. `--skip-map` still skips the map once.
+
+Reset with `rig config reset policies.claude_compaction.preparation_root` to restore the default.
+The setting applies to new attempts without restarting the daemon.
+
+The managed `/compact` command keeps its 600-character budget. When the selected map path or
+the attempt's compaction instruction does not fit, the existing restore request carries it;
+it never substitutes a newer preparation root or instruction. An explicitly selected root's
+published map is also named in that request when the path fit in `/compact`. The default root
+keeps the existing command/restore handoff. Under `--skip-map`, restore still recognizes an
+optional map completed at that attempt's path, or says that no map was required.
+
+The compaction preparation and command-submission tests cover manual and automatic attempts,
+long paths and instructions, settings changed during preparation, directory failures and
+late maps after cancellation or expiry. They use synthetic delivery and filesystem fixtures;
+they do not prove a live Claude session's permission choices or compaction behavior.
+
 ### Codex compaction and sizing
 
 OpenRig's managed compaction is for Claude Code seats only, by design. That covers `rig compact`, the
@@ -627,6 +673,28 @@ The shipped kernel seats no longer project their role into shared guidance.
 Existing user files and legacy role blocks are left intact; this is not a cleanup
 of already-installed shared blocks. General user-authored guidance projection is
 unchanged.
+
+The other shipped agent specs that start a seat with `guidance/role.md` mark that
+file `orientation: role` too, so `rig queue whoami --json` reports their role and
+refocus names it. They never projected a role into shared guidance; their startup
+delivery is unchanged.
+
+**Removing a leftover shared role block by hand.** A kernel installed before 0.6.5
+may still hold one seat's old role in its working directory's `CLAUDE.md` (or the
+rig's configured `managed_blocks` file) or `AGENTS.md`. Upgrading doesn't remove it.
+`rig down` removes OpenRig's managed blocks from that file when no other running
+rig uses it, so it stays until then. To remove it sooner, by hand:
+
+1. Find the exact block: the lines from `<!-- BEGIN OpenRig MANAGED BLOCK: role -->`
+   through `<!-- END OpenRig MANAGED BLOCK: role -->` (in older files, `RIGGED`
+   instead of `OpenRig`). Only the block whose id is exactly `role`; leave
+   `rig-role`, other ids and everything outside the markers alone.
+2. Confirm each seat that shares that directory has its per-seat replacement:
+   `rig queue whoami --json` run in the seat reports `role.state` as `present`.
+   A seat started before it was upgraded still has the old content in its
+   conversation; restart it fresh if you want it to start from the per-seat role.
+3. Keep a copy of the file, remove only those lines, and compare the result with
+   the copy: nothing else in the file should differ.
 
 **Separate project context from role**
 
