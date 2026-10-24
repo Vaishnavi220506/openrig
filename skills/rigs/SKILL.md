@@ -110,7 +110,13 @@ person needs in their project or home folder and name that path.
   `rig attach --self --rig <rigId> --pod operator --member person-agent --runtime <claude-code|codex> --print-env`.
   `--node <logicalId>` binds to an existing seat instead. Attach once, and keep the variables it prints
   (`OPENRIG_NODE_ID` and `OPENRIG_SESSION_NAME`). Each command may run in a fresh shell, so put them in front of every
-  later `rig` command. Check with `rig whoami --json`.
+  later `rig` command. Check with `rig whoami --json`, and use it or `rig seat status` later for identity and state,
+  not `rig attach --json` output. Don't print `OPENRIG_ACTIVITY_*` values: they're credentials.
+  If they decline, a message that must still say who it's from can go as a queue item with a declared source,
+  `rig queue create --source <their id>@external --destination <seat> --summary "<one line>" --body-file <file>`: the
+  seat sees that name, recorded as declared, and can reply to them if they're registered (`rig gateway human list`).
+  A declared name is a claim, not a seat's own identity: for a team that acts only on seat identity, the attached
+  shell above is the route.
 - **Give the operator the goal:** ask what they want worked on, in which repository and on which branch, unless they've
   said. Find the `operator.agent` row in `rig ps --nodes --rig kernel --json`, take its `canonicalSessionName`
   (never the logical ID or a guessed name) and send:
@@ -134,7 +140,12 @@ person needs in their project or home folder and name that path.
   others waiting, one line each (seat, exact action, the choices offered). Before sending their choice, capture that
   seat again: if its prompt changed, don't reuse the answer. Then send exactly the choice they made for that prompt
   (`rig send --help` says how to send a digit, a letter or Escape to a prompt). A yes to one prompt isn't a
-  yes to the next, and never pick a "don't ask again" choice they didn't pick. Another kind of menu you can answer with
+  yes to the next, and never pick a "don't ask again" choice they didn't pick. If they've told you outright to decide a
+  kind of future prompt (say, "approve prompts that only write inside my project"), you may decide each one: read its
+  whole action, answer only when it's clearly inside what they said, and tell them you answered under that instruction,
+  not that they said yes. Bring anything unclear or outside it back to them; a command's name or a path that looks like
+  their project doesn't show what the action touches. Their instruction changes no permission setting.
+  Another kind of menu you can answer with
   the key that screen shows, or ask the person. Capture it again before sending anything more.
 - **Replies:** in a plain shell, other agents can't type into this session. Read work sent to you with
   `rig queue list --destination <your address>` and `rig queue show <id> --full`, and read an agent's screen with

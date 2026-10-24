@@ -25,8 +25,7 @@ import {
 } from "./composer-prompts.js";
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
 import { OutboxHandler } from "./outbox-handler.js";
-import { DraftAwareDelivery, type GuardedDeliverySummary } from "./draft-aware-delivery.js";
-import type { OutboxEntry } from "./outbox-handler.js";
+import { DraftAwareDelivery, type GuardedDeliverySummary, type QueueWakeFacts } from "./draft-aware-delivery.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import { claudeResumeRotation, type SessionRegistry } from "./session-registry.js";
@@ -34,15 +33,17 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import { latestHookPermissionPending, latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
 import type { EventBus } from "./event-bus.js";
 import type { AgentActivity } from "./types.js";
-import { DeliveryGuardError, type GuardTarget, type SeatDeliveryGuard } from "./seat-delivery-guard.js";
+import { DeliveryGuardError, type AdmissionInput, type GuardTarget, type SeatDeliveryGuard } from "./seat-delivery-guard.js";
+import { withUrgentLine } from "./urgent-line.js";
 import { wrapPaneEnvelope, appendDeliveredSegment, type EnvelopeScope } from "../lib/pane-envelope.js";
+import { isBoundTerminalSeat } from "./terminal-seat.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { isShellForeground } from "./shell-classifier.js";
 import { observeClaudeDelivery, verifyCodexPaneProcess, type ClaudeDeliveryObservation, type ClaudeResumeRotation, type NativeProcessLister } from "./native-process-lineage.js";
 import type { SlowOperationInstrumentation } from "./slow-op-recorder.js";
 import { hashSentText, type CaptureObserverSink, type CaptureSlot, type ObservationInput, type ObservedBinding } from "./capture-observer.js";
-import { isAttentionRequiredReadinessCode, type NodeBinding, type ReadinessResult } from "./runtime-adapter.js";
+import { isAttentionRequiredReadinessCode, type NodeBinding, type ReadinessOptions, type ReadinessResult } from "./runtime-adapter.js";
 import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, isRecoverableStartupFailure } from "./startup-orchestrator.js";
 
 // OPR.0.4.1.10 — send-readiness freshness. The runtime-hook store keeps a 5min freshness for activity
@@ -181,6 +182,10 @@ const CLAUDE_STATUS_WARNINGS = [
   /^✘ Auto-update failed: no write permission to npm prefix · Run claude doctor$/,
   /^tmux focus-events off · add 'set -g focus-events on' to ~\/\.tmux\.conf and re…$/,
   /^You've used (?:\d|[1-9]\d)% of your weekly limit · resets \d{1,2}(?::\d{2})?(?:am|pm) \(UTC\)$/,
+  // #1641: Claude 2.1.293's update banner, whatever installer it names.
+  /^Update available! Run: \S.*$/,
+  // The context hint, as Claude prints it; reported as the last line below the mode bar on one seat.
+  /^new task\? \/clear to save \d+(?:\.\d+)?k tokens$/,
 ];
 // Current Claude status rows need not end in "thinking)" or show "esc to interrupt".
 // Completed summaries such as "✻ Crunched for 2s" lack the live ellipsis/timer shape.
@@ -195,6 +200,8 @@ const CLAUDE_TIMERLESS_STATUS_PATTERN = /^[✶✢✳✻✽·*]\s+\S.*(?:…|\.{3
 export interface ClassifyPaneOptions {
   /** Treat a timer-less live status row above the composer as work in progress. */
   timerlessStatusIsLive?: boolean;
+  /** On a fresh Claude running hook, ignore numbered choices from pane history. */
+  currentClaudeDialogueOnly?: boolean;
   /** Opted-in typing guards retain styling and cursor evidence for this read. */
   composerSnapshot?: ComposerSnapshot;
   runtime?: string | null;
@@ -255,7 +262,7 @@ function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = 
   return { text: prompt.slice(indent.length), bar: lines[bar]!.trim(), framed, hasWarnings: bar < lines.length - 1, supportedWarningFooter, modeFooter, headSeen, liveStatus };
 }
 
-const unknown = (): ComposerInput => ({ state: "unknown", rows: [], columns: 0, cursorAtEnd: false, collapsedPaste: null });
+const unknown = (unknownReason: string, cursor?: ComposerSnapshot["cursor"]): ComposerInput => ({ state: "unknown", rows: [], columns: 0, cursorAtEnd: false, collapsedPaste: null, unknownReason, ...(cursor ? { cursor } : {}) });
 const rule = (line: string): boolean => /^[─━═-]{6,}(?: .+ [─━═-]+)?$/.test(line.trim());
 const codexFooter = (line: string): boolean => isComposerFooter(line)
   || /(?:\b\d+% context left\b|\bContext \[)/.test(line);
@@ -295,13 +302,14 @@ function styledTextLines(screen: string) {
  */
 export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime: string | null = null, owned?: import("./composer-prompts.js").ComposerOwnership): ComposerInput {
   const promptClass = composerPromptClassForRuntime(runtime);
-  if (!snapshot || snapshot.inMode) return unknown();
+  if (!snapshot) return unknown("capture_unavailable");
+  if (snapshot.inMode) return unknown("pane_in_mode", snapshot.cursor);
   const { x, y, width, height } = snapshot.cursor;
-  if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || x >= width || y >= height || width < 3 || height < 1) return unknown();
+  if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || x >= width || y >= height || width < 3 || height < 1) return unknown("invalid_cursor", snapshot.cursor);
   const styled = styledTextLines(snapshot.screen);
   const lines = styled.map(line => line.text);
   if (lines.at(-1) === "") lines.pop();
-  if (lines.length > height || !lines[y]) return unknown();
+  if (lines.length > height || !lines[y]) return unknown("incomplete_frame", snapshot.cursor);
   const footerAt = findClaudeFooterIndex(lines);
   const footer = lines[footerAt]?.trim() ?? "";
   let claudeEnd = footerAt - 1;
@@ -340,6 +348,7 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
     // A literal placeholder or text before a moved cursor remains authored input.
     const cursorRow = y - start;
     let ghost: ComposerInput["ghost"];
+    let suggestionRows: string[] = [];
     const currentRow = rows[cursorRow]!;
     let cursorOffset = x === prefix ? 0 : -1;
     let offset = 0;
@@ -353,6 +362,7 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
         faint: styled[y + i]!.faintCells.slice(prefix + (i === 0 ? cursorOffset : 0), prefix + row.length),
       }));
       if (suffix.some(row => row.text.length > 0) && suffix.every(row => row.faint.every(Boolean))) {
+        suggestionRows = suffix.map(row => row.text);
         ghost = { line: y, offset: prefix + cursorOffset, continuationRows: rows.length - cursorRow - 1 };
         rows.splice(cursorRow + 1);
         rows[cursorRow] = currentRow.slice(0, cursorOffset);
@@ -372,7 +382,7 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
     const cursorAtEnd = y === start + last && x === prefix + stringWidth(visible[last] ?? "");
     const label = visible.length === 1 && COMPOSER_COLLAPSED_PASTE_PATTERN.test(visible[0]!) ? visible[0]! : null;
     const frame = JSON.stringify([prompt.glyph, prefix, width, footer]);
-    const input: ComposerInput = { state: empty ? "empty" : "text", rows: visible, columns: width - prefix, cursorAtEnd, collapsedPaste: label, frame,
+    const input: ComposerInput = { state: empty ? "empty" : "text", cursor: { ...snapshot.cursor }, suggestionRows, rows: visible, columns: width - prefix, cursorAtEnd, collapsedPaste: label, frame,
       ...(ghost ? { ghost } : {}) };
     // A numbered body is allowed only as this operation's exact text in its
     // previously empty composer. A newly observed menu gains no such authority.
@@ -384,7 +394,7 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
     }
     candidates.push(input);
   }
-  return candidates.length === 1 ? candidates[0]! : unknown();
+  return candidates.length === 1 ? candidates[0]! : unknown(candidates.length ? "ambiguous_composer" : "unrecognized_composer", snapshot.cursor);
 }
 
 
@@ -527,8 +537,19 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
     ? promptScanLines.slice(oldQuestionEnd + 1)
     : options.runtime === "codex" && !permissionPromptEvidence
       ? codexCurrentSelectionLines(paneContent) ?? promptScanLines : promptScanLines;
+  const currentComposer = options.currentClaudeDialogueOnly && options.runtime === "claude-code"
+    ? composerRegion(paneContent, "claude-code")
+    : null;
+  const currentComposerText = currentComposer?.body ?? (currentComposer?.markerLine !== null && currentComposer?.markerLine !== undefined
+    && currentComposer.closingRuleLine !== null && currentComposer.closingRuleLine !== undefined
+    ? paneContent.split(/\r?\n/).slice(currentComposer.markerLine - 1, currentComposer.closingRuleLine - 1).join("\n")
+    : null);
+  const currentComposerSelection = currentComposerText
+    ? findPatternEvidence(currentComposerText.split("\n").map(line => line.trimStart()), [COMPOSER_SELECTION_SCAN_PATTERN])
+    : null;
   const selectionPromptEvidence = currentClaudeMcpMenu(paneContent) ?? findCurrentClaudeQuestion(paneContent) ??
-    findPatternEvidence(selectionLines, [COMPOSER_SELECTION_SCAN_PATTERN]);
+    currentComposerSelection ?? (options.currentClaudeDialogueOnly ? null
+      : findPatternEvidence(selectionLines, [COMPOSER_SELECTION_SCAN_PATTERN]));
   if (selectionPromptEvidence) {
     return {
       state: "attention",
@@ -646,6 +667,8 @@ export async function probeSessionActivity(input: {
   /** See ClassifyPaneOptions.timerlessStatusIsLive. */
   timerlessStatusIsLive?: boolean;
   visibleScreenOnly?: boolean;
+  /** Limit numbered-choice detection to current Claude dialogue and composer evidence. */
+  currentClaudeDialogueOnly?: boolean;
   /** Supplied only by an active draft-aware send; ordinary observations stay unchanged. */
   composerSnapshot?: () => Promise<ComposerSnapshot | null>;
   /** The seat's community harness (`communityHarnessOf`): its idle-looking screen reads unknown. */
@@ -766,7 +789,10 @@ export async function probeSessionActivity(input: {
     const snapshot = input.composerSnapshot ? await input.composerSnapshot().catch(() => null) : null;
     const paneContent = snapshot?.screen ?? await capture();
     const capturedAt = new Date().toISOString();
-    const classifyOptions = { timerlessStatusIsLive: input.timerlessStatusIsLive === true };
+    const classifyOptions = {
+      timerlessStatusIsLive: input.timerlessStatusIsLive === true,
+      currentClaudeDialogueOnly: input.currentClaudeDialogueOnly === true,
+    };
     let classification = communityHarnessPaneActivity(classifyPaneActivity(paneContent ?? "", { ...classifyOptions,
       composerSnapshot: snapshot ?? undefined, runtime }), input.communityHarness);
     // Claude renders its prompt suggestion faint, which the plain capture loses. When a Claude pane reads
@@ -1545,6 +1571,16 @@ export interface SendOpts {
   identityProvenance?: string;
   /** Internal wake provenance, never accepted from the public transport route. */
   queueWake?: boolean;
+  /** Internal: this send is OpenRig's own (a watchdog, a scheduler wake, a notice, the compaction enforcer). Never accepted
+   *  from HTTP send options. It marks the send's source for the seat's interruption level and changes nothing else. */
+  openrigNotice?: true;
+  /** Marked urgent, and by whom (the authenticated sender, or the queue item's source). A seat's interruption level lets an
+   *  urgent message type; it's shown on delivery. */
+  urgent?: { by: string };
+  /** Internal, for a combined queue wake: called under the seat's lease, where delivery is decided (`held` is that
+   *  decision), with how the seat's level would treat each input now. It returns the members that still go with this send:
+   *  their text and outbox ids. Never accepted from HTTP. */
+  recheckMembers?: (holds: (input: AdmissionInput) => boolean, held: boolean) => { text: string; outboxIds: string[] };
   /** Internal observation of a completed input effect; never a permission callback. */
   onInputEffect?: (phase: "pasted" | "submitted") => void;
   /** Internal managed lifecycle prerequisite; never accepted from HTTP send options. */
@@ -1553,7 +1589,7 @@ export interface SendOpts {
    *  `caller_cancelled` and never writes, then or later. Once input may have started it is ignored: the result stays
    *  attempted or written. Queue wakes and committed outbox deliveries have no caller and ignore it. */
   signal?: AbortSignal;
-  /** Stable caller request ID, reused for readback after transport uncertainty. */
+  /** Optional reference for a manually held record; never deduplicates an explicit input request. */
   deliveryId?: string;
   auditPointer?: string;
   /** Internal queue seam: already committed original members, never client-supplied. */
@@ -1581,6 +1617,8 @@ export interface SendOpts {
   // send. `actorSession` is the caller identity recorded in that audit. (`--raw` is purely a CLI-side
   // envelope concern — the daemon guard behaves identically for raw and wrapped text.)
   dangerouslyInteract?: boolean;
+  /** Explicit per-send choice: no input inspection or clearing. Only with dangerouslyInteract. */
+  typeWithoutChecking?: boolean;
   reason?: string;
   actorSession?: string | null;
   // GHOST-STAGE (h): the envelope's compose stamp (ISO), threaded to send() so the WRITE-moment
@@ -1603,6 +1641,13 @@ export interface SendOpts {
    *  renders as "[Pasted text #N +X lines]"; X must match this count for the placeholder to count
    *  as evidence of THIS piece. */
   expectedStagedLineCount?: number;
+  /** The text without the From/To envelope. When set and the recipient is a terminal seat
+   *  (`runtime: terminal`), send() types this instead of `text`, so the shell never runs the
+   *  envelope lines. Agent recipients keep `text`. */
+  exactText?: string;
+  /** Internal: send() is typing `exactText` to a terminal seat, so its bytes stay exactly as given: no urgent line, which
+   *  the shell would run. An urgent mark still admits the input and stays in the result. Never accepted from HTTP. */
+  typedExactly?: true;
 }
 
 const CALLER_CANCELLED = "caller_cancelled";
@@ -1628,9 +1673,26 @@ export interface BroadcastOpts extends SendOpts {
   // deterministic tests) now lives on the base SendOpts — (h) send() reads it for delivered-latency.
 }
 
+/** Transient caller-only evidence. Never put these rows in receipts, events or held messages. */
+export interface ExistingInput {
+  target: GuardTarget;
+  classification: "typed_or_pasted" | "suggestion_only" | "empty" | "unreadable" | "not_checked";
+  rows: string[];
+  suggestionRows: string[];
+  cursor: ComposerSnapshot["cursor"] | null;
+  fullContentsVisible: boolean;
+  reason?: string;
+  cleared: false;
+}
+
+type OverrideInputAudit = { classification: ExistingInput["classification"]; visibleRows: number; suggestionRows: number; choice: "inspect" | "type_without_checking"; outcome: "stopped" | "proceed"; clearAttempted: false };
+
 export interface SendResult {
+  existingInput?: ExistingInput;
   ok: boolean;
   sessionName: string;
+  /** Present when the send was marked urgent: who marked it. */
+  urgent?: { by: string };
   verified?: boolean;
   /** Audited prompt answer: consumers must never automatically retry Enter.
    * Neither value establishes model consumption. Absent for ordinary sends. */
@@ -1663,8 +1725,8 @@ export interface SendResult {
   waitedMs?: number;
   attempts?: number;
   sent?: boolean;
-  /** Present only when transport.verify_input_box applied to this send. */
-  inputBox?: InputBoxEvidence;
+  /** The recipient is a terminal seat, so `exactText` was typed without the From/To envelope. */
+  envelopeOmitted?: true;
   /** Context, not a status: the seat was in a managed compaction or restore OpenRig had recorded when this send ran. The
    *  send's own result (ok, outcome, error) is unchanged by it, and it never says the restore finished. */
   managedCompaction?: { stage: string; observed: "before_send" | "after_send"; notice: string };
@@ -1679,27 +1741,22 @@ export interface SendResult {
  *  (the sent text, but a row break in the box may fall inside a word, so its word boundaries cannot be told),
  *  `empty`, `queued` (Claude's queued-messages label, or an empty box while a turn was running, so the message may
  *  wait behind it), `hidden` (a collapsed paste label), `other` (any other text), `unrecognized` (no recognized
- *  input box, or a frame that names another client version), `unavailable` (no capture, or none in time) or
- *  `unchecked` (this path does not read the box: an audited prompt answer). */
-export type InputBoxReading = "exact" | "ambiguous" | "empty" | "queued" | "hidden" | "other" | "unrecognized" | "unavailable" | "unchecked";
+ *  input box, or a frame that names another client version) or `unavailable` (no capture, or none in time). */
+export type InputBoxReading = "exact" | "ambiguous" | "empty" | "queued" | "hidden" | "other" | "unrecognized" | "unavailable";
 
 /** With transport.verify_input_box on: what the seat showed before the paste, and what a Claude Code or Codex
- *  input box showed before and after Enter. Reporting only. `verified` is true only for a seat proven idle
- *  before the paste, then exact, then empty, on the same pane process (`#{pane_pid}`, the pane's root process);
- *  that means the box was cleared after holding the text, normally by our Enter, never that the model read it.
- *  `sameProcess` compares the pane's root process (usually a shell) and the seat's binding: an agent restarted
- *  under the same shell is not caught by it, and the same pane and binding are not proof of the same native
- *  conversation. An audited prompt answer is not checked: `seat`, `before` and `after` read `unchecked`,
- *  `sameProcess` is false (a boolean, as on every other path), and the send reads unconfirmed. */
-export interface InputBoxEvidence {
-  seat: SeatReading | "unchecked";
+ *  input box showed before and after Enter. It decides the send's verdict: `verified` is true only for a seat
+ *  proven idle before the paste, then exact, then empty, on the same pane process (`#{pane_pid}`, the pane's root
+ *  process); that means the box was cleared after holding the text, normally by our Enter, never that the model
+ *  read it. `sameProcess` compares the pane's root process (usually a shell) and the seat's binding: an agent
+ *  restarted under the same shell is not caught by it, and the same pane and binding are not proof of the same
+ *  native conversation. An audited prompt answer reads no box, so it reads unconfirmed. */
+interface InputBoxEvidence {
+  seat: SeatReading;
   before: InputBoxReading;
   after: InputBoxReading;
   sameProcess: boolean;
 }
-
-/** The evidence of a verified send whose path does not read the input box (an audited prompt answer). */
-const INPUT_BOX_UNCHECKED: InputBoxEvidence = { seat: "unchecked", before: "unchecked", after: "unchecked", sameProcess: false };
 
 export interface CaptureResult {
   ok: boolean;
@@ -1722,7 +1779,7 @@ export interface BroadcastResult {
 }
 
 export interface TransportReadinessChecker {
-  checkReady?(binding: NodeBinding): Promise<ReadinessResult>;
+  checkReady?(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult>;
 }
 
 interface SessionTransportDeps {
@@ -1767,6 +1824,10 @@ interface SessionReconciliationSnapshot {
   startup_completed_at: string | null;
   resume_type: string | null;
   resume_token: string | null;
+  resume_provenance: string | null;
+  resume_rotated_from: string | null;
+  resume_rotated_process: string | null;
+  resume_launch_process: string | null;
   binding_session: string | null;
   binding_window: string | null;
   binding_pane: string | null;
@@ -1818,7 +1879,7 @@ export class SessionTransport {
       (session, text, opts) => this.sendUnguarded(session, text, opts));
   }
 
-  configureGuardedWakes(applicable: (entries: readonly OutboxEntry[]) => boolean): void {
+  configureGuardedWakes(applicable: (entries: readonly QueueWakeFacts[]) => boolean): void {
     this.guardedDelivery?.configureWakes(applicable);
   }
 
@@ -2122,10 +2183,12 @@ export class SessionTransport {
 
   get deliveryGuard() { return this.tmuxAdapter.deliveryGuard; }
 
-  retentionTarget(sessionName: string) {
+  /** With an input, whether the seat's level would hold that input; without one, whether its mode holds everything. */
+  retentionTarget(sessionName: string, input?: AdmissionInput) {
     const guard = this.tmuxAdapter.deliveryGuard;
     const target = guard?.maybeTarget(sessionName);
     if (!guard || !target) return null;
+    if (input) return guard.holdsInput(target.nodeId, input) ? target : null;
     const pref = guard.preference(target.nodeId);
     return pref.desired || pref.effective ? target : null;
   }
@@ -2152,6 +2215,15 @@ export class SessionTransport {
    * send, add a notice saying so. The notice is context beside the send's own result, which it never changes.
    */
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    // A terminal seat's shell would run the envelope lines as commands. Swap before the guard,
+    // whose outbox body, hash and delivery-ID identity all key on the text actually typed.
+    // Without the envelope there's no Sent: line, so stampISO is dropped too: the delivered-latency
+    // segment must never edit a line of the exact text.
+    if (opts?.exactText !== undefined && !opts.dangerouslyInteract) {
+      const { exactText, ...rest } = opts;
+      if (!isBoundTerminalSeat(this.db, sessionName)) return this.send(sessionName, text, rest);
+      return { ...(await this.send(sessionName, exactText, { ...rest, stampISO: undefined, typedExactly: true })), envelopeOmitted: true };
+    }
     const observe = () => { try { return this.compactionObserver?.(sessionName) ?? null; } catch { return null; } };
     const before = observe();
     const result = await this.sendWithoutCompactionNotice(sessionName, text, opts);
@@ -2163,7 +2235,20 @@ export class SessionTransport {
   }
 
   private async sendWithoutCompactionNotice(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    if (!opts?.urgent) return this.sendClassified(sessionName, text, opts);
+    // Shown on delivery, and kept with a held message: who marked it urgent.
+    console.info(`[transport] urgent send to ${sessionName}, marked by ${opts.urgent.by}`);
+    // An explicit prompt answer is typed as keys, and a submit-only retry types no text at all: the label's letters would
+    // act as keystrokes (a menu shortcut, say). A terminal seat's exact text would run the label as a command. Their bytes
+    // stay exactly as given; the mark stays in the result and the log.
+    const rawKeys = opts.dangerouslyInteract === true || opts.submitOnly === true || opts.typedExactly === true;
+    const result = await this.sendClassified(sessionName, rawKeys ? text : withUrgentLine(text, opts.urgent.by), opts);
+    return { ...result, urgent: opts.urgent };
+  }
+
+  private async sendClassified(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
     const guard = this.tmuxAdapter.deliveryGuard;
+    const admission: AdmissionInput = { source: opts?.openrigNotice ? "openrig" : "agent", urgent: !!opts?.urgent, override: opts?.dangerouslyInteract === true };
     if (!guard) {
       // No guard, so no recorded delivery to read back: a caller already gone ends the send here.
       if (callerSignal(opts)?.aborted) return callerCancelled(sessionName);
@@ -2174,7 +2259,9 @@ export class SessionTransport {
       return result;
     }
     const outbox = new OutboxHandler(this.db);
-    const ids = opts?.committedOutboxIds ?? [opts?.deliveryId ?? `guard-send-${randomUUID()}`];
+    let ids = opts?.committedOutboxIds ?? [opts?.deliveryId ?? `guard-send-${randomUUID()}`];
+    // A combined wake's members are re-checked under the lease, against the configuration that decides this send.
+    const recheck = (held: boolean) => opts?.recheckMembers?.((input) => guard.holdsInput(guard.target(sessionName).nodeId, input), held) ?? null;
     const retainedResult = (reason = "typing_guard_enabled"): SendResult => ({ ok: true, sessionName, outcome: "retained", sent: false, verified: false,
       outboxIds: ids, reason, warning: `Retained, not delivered. Inspect with rig seat held-messages ${sessionName}; changing protection does not replay held messages.` });
     try {
@@ -2188,21 +2275,6 @@ export class SessionTransport {
           }
         }
       }
-      const existing = this.guardedDelivery?.existing(sessionName, text, opts ?? {}, ids);
-      if (existing) return existing;
-      // Idempotent readback also after disabling: an old retained ID never becomes a new send.
-      // (P2: this readback is NOT a new retention and is outside the retained_no_write seam.)
-      if (!opts?.committedOutboxIds && opts?.deliveryId) {
-        const prior = outbox.getById(opts.deliveryId);
-        if (prior?.guardBinding) {
-          if (prior.body !== text || prior.destinationSession !== sessionName || prior.senderSession !== (opts.actorSession ?? "unknown")) {
-            return { ok: false, sessionName, sent: false, reason: "delivery_identity_conflict", error: "Delivery ID names different content/identity." };
-          }
-          if (prior.deliveryState === "retained" || prior.deliveryState === "retired") return retainedResult();
-        }
-      }
-      // A recorded delivery has answered with its own outcome above; with nothing recorded, a caller already gone
-      // ends the send here.
       if (callerSignal(opts)?.aborted) return callerCancelled(sessionName);
       // #1084 — the idle wait must not occupy the seat's serial lease: a long
       // --wait-for-idle inside guard.operation holds up other sends and queue
@@ -2240,31 +2312,28 @@ export class SessionTransport {
         }
       }
       const result = await guard.operation(sessionName, async () => {
-        if (this.guardedDelivery && !sendOpts?.submitOnly && guard.needsInputCheck(sessionName)) {
-          // Up to its durable record a draft-aware send is still the caller's: one that went away while this send
-          // waited for the lease ends here, unless a record for this delivery already exists. DraftAwareDelivery.send
-          // commits that record synchronously before its first await, so no cancellation lands between this check
-          // and the commit; after the commit a caller going away doesn't cancel it.
-          if (callerSignal(sendOpts)?.aborted && !this.guardedDelivery.existing(sessionName, text, sendOpts ?? {}, ids)) {
-            return callerCancelled(sessionName);
-          }
-          return this.guardedDelivery.send(sessionName, text, { ...sendOpts, signal: undefined }, ids);
+        const members = recheck(false);
+        const memberText = members?.text ?? text;
+        const memberOpts = members ? { ...sendOpts, committedOutboxIds: members.outboxIds } : sendOpts;
+        if (this.guardedDelivery && !memberOpts?.submitOnly && !memberOpts?.dangerouslyInteract && guard.needsInputCheck(sessionName)) {
+          if (callerSignal(memberOpts)?.aborted) return callerCancelled(sessionName);
+          return this.guardedDelivery.send(sessionName, memberText, memberOpts ?? {},
+            memberOpts?.committedOutboxIds ?? [`guard-send-${randomUUID()}`]);
         }
-        const prior = this.guardedDelivery?.existing(sessionName, text, sendOpts ?? {}, ids);
-        return prior ?? this.sendUnguarded(sessionName, text, sendOpts);
+        return this.sendUnguarded(sessionName, memberText, memberOpts);
       }, async target => {
-        const prior = this.guardedDelivery?.existing(sessionName, text, sendOpts ?? {}, ids);
-        if (prior) return prior;
         if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
         // Nothing is retained yet: a caller that went away while this send waited for the lease ends it here.
         if (callerSignal(opts)?.aborted) return callerCancelled(sessionName);
+        const members = recheck(true);
+        if (members) ids = members.outboxIds;
         this.db.transaction(() => {
           for (const id of ids) {
             const prior = opts?.committedOutboxIds ? outbox.getById(id) : null;
             if (opts?.committedOutboxIds && (!prior || prior.destinationSession !== sessionName)) throw new Error("Committed wake target/ID mismatch");
             outbox.retain(prior ? { ...prior, outboxId: id, tags: prior.tags ?? undefined, auditPointer: prior.auditPointer ?? undefined } : {
               outboxId: id, senderSession: opts?.actorSession ?? "unknown", destinationSession: sessionName, body: text, auditPointer: opts?.auditPointer,
-              identityProvenance: opts?.identityProvenance,
+              identityProvenance: opts?.identityProvenance, ...(opts?.urgent ? { urgency: "urgent" } : {}),
             }, target, !!opts?.committedOutboxIds);
           }
         })();
@@ -2284,7 +2353,7 @@ export class SessionTransport {
           });
         }
         return retainedResult();
-      });
+      }, admission);
       if (result.ok && result.sent !== false) {
         await this.reconcileStartupReadiness(sessionName).catch(() => {});
       }
@@ -2425,6 +2494,7 @@ export class SessionTransport {
       attachmentType: meta.attachmentType,
       timeoutMs,
       binding: { sessionName, nodeId: meta.nodeId, occupant: meta.occupant, pane: meta.pane },
+      privateInput: opts.dangerouslyInteract === true,
       readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
       signal: callerSignal(opts), cancelledBy: "caller",
     });
@@ -2485,14 +2555,17 @@ export class SessionTransport {
         error: `'${sessionName}' is in a tmux mode (such as copy mode) and could not leave it, so Enter would not reach the agent. ${outcome}` };
     };
     // S01/S02 P2 observation context, frozen at attempt entry before any await.
-    const observed = this.captureObserver ? {
+    const observed = this.captureObserver && !opts?.dangerouslyInteract ? {
       attemptId: randomUUID(),
       binding: Object.freeze({ sessionName, nodeId: sessionMeta.nodeId, occupant: sessionMeta.occupant, pane: sessionMeta.pane }),
       pre: (opts?.verify ? { state: "not_reached" } : { state: "not_requested" }) as CaptureSlot,
       post: (opts?.verify ? { state: "not_reached" } : { state: "not_requested" }) as CaptureSlot,
       sentHash: null as string | null,
     } : null;
+    let existingInput: ExistingInput | undefined;
+    let overrideBeforePaste: (() => Promise<void>) | undefined;
     const observe = (result: SendResult): SendResult => {
+      if (existingInput) result = { ...result, existingInput };
       if (result.ok && runtimeAdvisory) result = { ...result, warning: [runtimeAdvisory, result.warning].filter(Boolean).join(" ") };
       if (observed && this.captureObserver) {
         safeRecord(this.captureObserver, {
@@ -2672,6 +2745,7 @@ export class SessionTransport {
         attachmentType: sessionMeta.attachmentType,
         timeoutMs: waitForIdleMs,
         binding: observed?.binding,
+        privateInput: opts?.dangerouslyInteract === true,
         readinessFromPaneOnly: opts?.readinessFromPaneOnly === true,
         signal: callerSignal(opts), cancelledBy: "caller",
       });
@@ -2729,6 +2803,7 @@ export class SessionTransport {
           // Message-only: the re-wait runs on the leftover budget, but the
           // timeout names the configured --wait-for-idle value.
           timeoutLabelMs: waitForIdleMs,
+          privateInput: opts.dangerouslyInteract === true,
           binding: observed?.binding,
           readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
           signal: callerSignal(opts), cancelledBy: "caller",
@@ -2756,7 +2831,7 @@ export class SessionTransport {
           attachmentType: sessionMeta.attachmentType,
           binding: observed?.binding,
           readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
-        });
+        }, opts.dangerouslyInteract === true);
         if (recheck.state !== "idle") {
           const late: { reason: string; error: string } =
             recheck.state === "needs_input"
@@ -2805,14 +2880,15 @@ export class SessionTransport {
     // the positive-picker guard (FR-4 — the footgun separation). The advisory is carried on the
     // success result via `warning` so the honest telemetry is surfaced.
     let sendAdvisory: string | undefined;
-    const promptOverride = waitForIdleMs === undefined && Boolean(opts?.dangerouslyInteract);
-    if (waitForIdleMs === undefined) {
+    // Broadcast can carry wait + override: after waiting, it still uses the same deliberate-input boundary.
+    const promptOverride = Boolean(opts?.dangerouslyInteract);
+    if (waitForIdleMs === undefined || promptOverride) {
       const readiness = await this.classifySendReadiness({
         sessionName,
         runtime,
         attachmentType: sessionMeta.attachmentType,
         binding: observed?.binding,
-      });
+      }, opts?.dangerouslyInteract === true);
 
       // Explicit interaction selects key input even when readiness cannot recognize the prompt.
       // Only bypassing a positive picker requires a successful audit; other states already sent.
@@ -2825,12 +2901,33 @@ export class SessionTransport {
             error: "--dangerously-interact requires --reason explaining why the prompt is being driven. No text was sent.",
           };
         }
-        const audit = this.recordPromptOverride({
-          sessionName,
-          readiness,
-          actorSession: opts.actorSession ?? null,
-          overrideReason: opts.reason ?? null,
-        });
+        const auditInput = { sessionName, readiness, actorSession: opts.actorSession ?? null, overrideReason: opts.reason ?? null };
+        const target = this.tmuxAdapter.deliveryGuard?.maybeTarget(sessionName);
+        // Native menus retain their audited key-driving path. Otherwise inspect under the same lease,
+        // after buffer preparation, immediately before the adapter's final identity check and paste.
+        if (target && readiness.state !== "needs_input") {
+          overrideBeforePaste = async () => {
+            const unchecked = opts.typeWithoutChecking === true;
+            const snapshot = unchecked ? null : await this.readWithinDeadline("session_transport.override_input",
+              () => this.tmuxAdapter.captureComposerSnapshot(target.pane ?? sessionName));
+            const input = unchecked ? null : inspectComposerInput(snapshot, runtime);
+            const classification: ExistingInput["classification"] = unchecked ? "not_checked" : input!.state === "unknown" ? "unreadable"
+              : input!.state === "text" ? "typed_or_pasted" : input!.ghost ? "suggestion_only" : "empty";
+            existingInput = { target, classification, rows: input?.rows ?? [], suggestionRows: input?.suggestionRows ?? [],
+              cursor: input?.cursor ?? null, fullContentsVisible: !!input && input.state !== "unknown" && !input.collapsedPaste,
+              ...(input?.unknownReason ? { reason: input.unknownReason } : {}), cleared: false };
+            const stopped = classification === "typed_or_pasted" || classification === "unreadable";
+            const audit = this.recordPromptOverride({ ...auditInput, input: { classification, visibleRows: existingInput.rows.length,
+              suggestionRows: existingInput.suggestionRows.length, choice: unchecked ? "type_without_checking" : "inspect",
+              outcome: stopped ? "stopped" : "proceed", clearAttempted: false } });
+            if (!audit.ok) sendAdvisory = `prompt-override: audit unavailable (${audit.reason}).`;
+            if (stopped) throw new DeliveryGuardError(classification === "unreadable" ? "override_input_unknown" : "override_input_present",
+              classification === "unreadable" ? "Input could not be read. Nothing was typed. Inspect the native terminal, deliberately clear its prompt with native/tmux controls, then retry; or explicitly choose --type-without-checking (does not clear)."
+                : "Existing typed or pasted input (author unknown). Nothing was typed. Inspect the shown input, deliberately clear the prompt with native/tmux controls, then retry. Manual clearing is outside OpenRig's lease and observation checks and is not recorded.");
+            if (unchecked) sendAdvisory = [sendAdvisory, "Input was not checked or cleared; this send may join or submit existing text."].filter(Boolean).join(" ");
+          };
+        }
+        const audit = overrideBeforePaste ? { ok: true as const } : this.recordPromptOverride(auditInput);
         if (!audit.ok && readiness.state === "needs_input") {
           return {
             ok: false,
@@ -2928,7 +3025,7 @@ export class SessionTransport {
       () => {
         opts?.beforeWrite?.();
         writeIssued = true;
-        if (promptOverride) return this.tmuxAdapter.sendText(sessionName, text, beforePaste, { bracketed: false });
+        if (promptOverride) return this.tmuxAdapter.sendText(sessionName, text, beforePaste, { bracketed: false, beforePaste: overrideBeforePaste });
         return beforePaste ? this.tmuxAdapter.sendText(sessionName, text, beforePaste) : this.tmuxAdapter.sendText(sessionName, text);
       },
       (result) => result.ok ? "ok" : "failed",
@@ -2938,13 +3035,15 @@ export class SessionTransport {
     }
     if (!textResult.ok) {
       // A draft refusal is the guard holding the write before any input; it is not an attempted write.
-      const policyRefusal = typeof textResult.code === "string" && textResult.code.startsWith("draft_");
+      const policyRefusal = typeof textResult.code === "string" && (textResult.code.startsWith("draft_") || textResult.code.startsWith("override_input_") || textResult.code === "managed_compaction_pending");
       return observe({
         ok: false,
         sessionName,
         reason: policyRefusal ? textResult.code : "send_failed",
         outcome: "failed",
-        ...(policyRefusal ? {} : { inputPhase: "attempted" as const }),
+        // The adapter's draft checks run before the paste (only file/buffer preparation precedes them), and its
+        // after-paste observation cannot fail the write, so a draft_* receipt proves the target input was never reached.
+        inputPhase: policyRefusal ? "not_reached" as const : "attempted" as const,
         error: `Failed to send text to '${sessionName}': ${textResult.message}`,
         ...(waitMode || policyRefusal ? { sent: false, ...waitEvidence } : {}),
       });
@@ -2980,7 +3079,6 @@ export class SessionTransport {
         if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
         if (!promptAnswerStaged(pane, text, runtime)) {
           return observe({ ok: true, sessionName, sent: true, verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified",
-            ...(inputBoxRuntime ? { inputBox: INPUT_BOX_UNCHECKED } : {}),
             warning: [sendAdvisory, "prompt-override: answer sent as unbracketed input; submission unverified. No trailing Enter: the complete answer is not visibly staged (it may have been consumed, the prompt changed, or observation is unavailable)."].filter(Boolean).join(" ") });
         }
         sendAdvisory = [sendAdvisory, "prompt-override: answer sent as unbracketed input; Enter submitted the complete still-staged answer."].filter(Boolean).join(" ");
@@ -2993,14 +3091,16 @@ export class SessionTransport {
         (result) => result.ok ? "ok" : "failed",
       );
       if (!submitResult.ok) {
-        const policyRefusal = typeof submitResult.code === "string" && submitResult.code.startsWith("draft_");
+        const policyRefusal = typeof submitResult.code === "string" && (submitResult.code.startsWith("draft_") || submitResult.code === "managed_compaction_pending");
         return observe({
           ok: false,
           sessionName,
           reason: policyRefusal ? submitResult.code : "submit_failed",
           outcome: "failed",
           inputPhase: "written",
-          error: `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
+          error: policyRefusal
+            ? `Text was pasted into '${sessionName}', but Enter was not sent: ${submitResult.message} Inspect the current input before submitting it.`
+            : `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
           ...(waitMode || policyRefusal ? { sent: true, ...waitEvidence } : {}),
         });
       }
@@ -3038,8 +3138,8 @@ export class SessionTransport {
         const count = envelope ? (pane: string, expected: string) => countEnvelopeOccurrences(pane, expected, promptClass) : countOccurrences;
         const preCount = count(transcript(preVerifyContent), snippet);
         const postCount = count(transcript(content), snippet);
-        // An audited prompt answer reads no box (no extra read is added for it), so it says so: unchecked, and
-        // unconfirmed; it never falls back to the count below.
+        // An audited prompt answer reads no box (no extra read is added for it), so it reads unconfirmed; it never
+        // falls back to the count below.
         const inputBox = boxBefore && inputBoxRuntime
           ? await this.inputBoxEvidence(sessionName, readTarget, sessionMeta, boxBefore, readInputBox(content, inputBoxRuntime, text, boxBefore.pane))
           : inputBoxRuntime && promptOverride ? INPUT_BOX_UNCHECKED : undefined;
@@ -3048,15 +3148,12 @@ export class SessionTransport {
         const verified = inputBoxRuntime
           ? inputBox?.seat === "idle" && inputBox.before === "exact" && inputBox.after === "empty" && inputBox.sameProcess
           : postCount > preCount;
-        return observe({ ok: true, sessionName, ...interaction, verified, outcome: verified ? "delivered" : "rendered-unconfirmed", ...(inputBox ? { inputBox } : {}), ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+        return observe({ ok: true, sessionName, ...interaction, verified, outcome: verified ? "delivered" : "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       } catch {
         if (observed && observed.post.state === "not_reached") {
           observed.post = { state: "unavailable", cause: "capture_error", capturedAt: this.now().toISOString(), captureSeq };
         }
-        const inputBox: InputBoxEvidence | undefined = boxBefore
-          ? { seat: boxBefore.seat, before: boxBefore.reading, after: "unavailable", sameProcess: false }
-          : inputBoxRuntime && promptOverride ? INPUT_BOX_UNCHECKED : undefined;
-        return observe({ ok: true, sessionName, ...interaction, verified: false, outcome: "rendered-unconfirmed", ...(inputBox ? { inputBox } : {}), ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+        return observe({ ok: true, sessionName, ...interaction, verified: false, outcome: "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       }
     }
 
@@ -3127,6 +3224,7 @@ export class SessionTransport {
     signal?: AbortSignal;
     /** Whose cancellation the signal carries: managed preparation (the default) or the send's caller. */
     cancelledBy?: "caller";
+    privateInput?: boolean;
     binding?: ObservedBinding;
     readinessFromPaneOnly?: boolean;
     // Optional display value for timeout messages. The deadline always comes
@@ -3221,12 +3319,12 @@ export class SessionTransport {
    *  caller's cancellation. Null when the deadline or the cancellation wins; the abandoned observation is ignored,
    *  never delivered on. */
   private async observeReadinessWithin(
-    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding; readinessFromPaneOnly?: boolean },
+    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding; readinessFromPaneOnly?: boolean; privateInput?: boolean },
     remainingMs: number,
     cancel?: AbortSignal,
   ): Promise<AgentActivity | null> {
     if (cancel?.aborted) return null;
-    const observation = this.classifySendReadiness(input);
+    const observation = this.classifySendReadiness(input, input.privateInput);
     observation.catch(() => undefined);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
@@ -3302,7 +3400,7 @@ export class SessionTransport {
     attachmentType: string | null;
     binding?: ObservedBinding;
     readinessFromPaneOnly?: boolean;
-  }): Promise<AgentActivity> {
+  }, privateInput = false): Promise<AgentActivity> {
     const now = this.now();
     let binding = input.binding;
     try {
@@ -3349,6 +3447,20 @@ export class SessionTransport {
     ) {
       // Fresh hook (within the 15s send window): authoritative for any state.
       if (this.hookFreshForSend(hookActivity, now)) {
+        if (hookActivity.state === "running" && input.runtime === "claude-code") {
+          const paneVeto = await probeSessionActivity({
+            composerSnapshot,
+            currentClaudeDialogueOnly: true,
+            sessionName: input.sessionName,
+            runtime: input.runtime,
+            attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
+            tmuxAdapter: this.tmuxAdapter,
+            now,
+            captureObserver: privateInput ? undefined : this.captureObserver,
+            binding: input.binding,
+          });
+          if (paneVeto.state === "needs_input") return paneVeto;
+        }
         return hookActivity;
       }
       // OPR.0.4.3.28 Part A — a stale-but-latest `idle` hook (older than the 15s
@@ -3372,7 +3484,7 @@ export class SessionTransport {
           attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
           tmuxAdapter: this.tmuxAdapter,
           now,
-          captureObserver: this.captureObserver,
+          captureObserver: privateInput ? undefined : this.captureObserver,
           binding,
         });
         if (paneVeto.state === "needs_input") {
@@ -3389,7 +3501,7 @@ export class SessionTransport {
       attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
       tmuxAdapter: this.tmuxAdapter,
       now,
-      captureObserver: this.captureObserver,
+      captureObserver: privateInput ? undefined : this.captureObserver,
       binding,
       // Pane-only readiness must not send into a status row whose timer hasn't appeared yet.
       timerlessStatusIsLive: input.readinessFromPaneOnly === true,
@@ -3545,6 +3657,7 @@ export class SessionTransport {
     readiness: AgentActivity;
     actorSession: string | null;
     overrideReason: string | null;
+    input?: OverrideInputAudit;
   }): { ok: true } | { ok: false; reason: string } {
     if (!this.eventBus) return { ok: false, reason: "audit_unconfigured" };
     const resolved = this.agentActivityStore?.resolveSession({ sessionName: input.sessionName });
@@ -3560,6 +3673,7 @@ export class SessionTransport {
         detectedReason: input.readiness.reason,
         evidenceSource: input.readiness.evidenceSource,
         overrideReason: input.overrideReason,
+        ...(input.input ? { input: input.input } : {}),
       });
       return { ok: true };
     } catch {
@@ -3711,6 +3825,7 @@ export class SessionTransport {
       // (h) thread the resolved stampISO so send()'s delivered-latency calc measures from the SAME
       // compose stamp the envelope carries (opts may not have carried one; the local stampISO is truth).
       const result = await this.send(session.sessionName, perRecipientText, { ...opts, stampISO,
+        exactText: opts?.envelopeSender ? text : undefined,
         deliveryId: opts?.deliveryId ? `${opts.deliveryId}:${session.sessionName}` : undefined });
       results.push(result);
     }
@@ -3728,7 +3843,7 @@ export class SessionTransport {
     return this.db.prepare(`
       SELECT n.id as node_id, r.id as rig_id, s.id as session_id, s.session_name, n.runtime, n.cwd,
              s.startup_status, s.status as session_status, s.startup_completed_at,
-             s.resume_type, s.resume_token,
+             s.resume_type, s.resume_token, s.resume_provenance, s.resume_rotated_from, s.resume_rotated_process, s.resume_launch_process,
              b.tmux_session as binding_session, b.tmux_window as binding_window, b.tmux_pane as binding_pane,
              b.updated_at as binding_updated_at,
              (SELECT generation_uuid FROM occupant_tenures WHERE node_id = n.id ORDER BY generation_ordinal DESC LIMIT 1) as occupant_generation,
@@ -3793,17 +3908,21 @@ export class SessionTransport {
       );
     };
 
+    // A Claude seat is checked with its real pane, occupant and recorded conversation (#1477); others keep the stand-in.
+    const claude = snapshot.runtime === "claude-code";
+    const rotation = claude ? claudeResumeRotation(snapshot) : null;
     const probeBinding: NodeBinding = {
       id: `session-transport:${snapshot.session_id}`,
       nodeId: snapshot.node_id,
       attachmentType: "tmux",
       tmuxSession: sessionName,
       tmuxWindow: null,
-      tmuxPane: null,
+      tmuxPane: claude ? snapshot.binding_pane : null,
       cmuxWorkspace: null,
       cmuxSurface: null,
       updatedAt: "",
       cwd: snapshot.cwd ?? "",
+      ...(claude && snapshot.occupant_generation ? { launchGeneration: snapshot.occupant_generation } : {}),
     };
 
     let timeoutTimer: NodeJS.Timeout | undefined;
@@ -3813,7 +3932,7 @@ export class SessionTransport {
 
     let readiness: ReadinessResult;
     try {
-      readiness = await Promise.race([checker.checkReady(probeBinding), timeoutPromise]);
+      readiness = await Promise.race([checker.checkReady(probeBinding, ...(claude && snapshot.resume_token ? [{ resumeToken: snapshot.resume_token, ...(rotation ? { resumeRotation: rotation } : {}) }] : [])), timeoutPromise]);
     } catch {
       return false;
     } finally {

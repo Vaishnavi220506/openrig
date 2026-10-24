@@ -11,9 +11,34 @@ import { SeatLaunchEnvironment } from "../src/domain/seat-launch-environment.js"
 import { shellQuote } from "../src/adapters/shell-quote.js";
 const exec = promisify(execFile);
 const waitFile = async (file: string) => {
-  for (let i=0; i<100 && !existsSync(file); i++) await new Promise(r=>setTimeout(r,25));
-  return readFileSync(file,"utf8").trim().split("|");
+  // Redirection creates the file before printf writes it; the final newline marks completion.
+  for (let i = 0; i < 100; i++) {
+    const text = existsSync(file) ? readFileSync(file, "utf8") : "";
+    if (text.endsWith("\n")) return text.trim().split("|");
+    await new Promise(r => setTimeout(r, 25));
+  }
+  throw new Error(`Timed out waiting for complete environment result: ${file}`);
 };
+describe("environment result completion", () => {
+  it("waits through an empty and partially written file", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "tmux-result-"));
+    const file = path.join(home, "result");
+    vi.useFakeTimers();
+    try {
+      writeFileSync(file, "");
+      let settled = false;
+      const result = waitFile(file).then(value => { settled = true; return value; });
+      await vi.advanceTimersByTimeAsync(25);
+      expect(settled).toBe(false);
+      writeFileSync(file, "first|");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(settled).toBe(false);
+      writeFileSync(file, "first|second\n");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(await result).toEqual(["first", "second"]);
+    } finally { vi.useRealTimers(); rmSync(home, { recursive: true, force: true }); }
+  });
+});
 describe.skipIf(process.platform === "win32")("#1178 initial-shell environment policy (actual adapter)", () => {
   for (const clean of [false,true]) for (const successor of [false,true]) {
     it(`${clean ? "daemon baseline" : "stock inherited"}, ${successor ? "successor" : "fresh"}: shell startup and classic function remain usable`, async () => {
@@ -25,7 +50,7 @@ describe.skipIf(process.platform === "win32")("#1178 initial-shell environment p
       const cli=path.join(home,"rig-fixture"), rc=path.join(home,"private.bashrc");
       writeFileSync(cli,"#!/bin/sh\nexit 0\n",{mode:0o755});
       // This deliberately custom default-command must still run; its function and override are intended setup.
-      writeFileSync(rc, `unset HISTFILE\nprintf '%s|%s|%s|%s' "\${Q1178_SERVER-absent}" "\${Q1178_DAEMON-absent}" "\${Q1178_AUTH-absent}" "\${TMUX_PANE-absent}" > ${shellQuote(initial)}\nexport Q1178_STARTUP=startup Q1178_AUTH=startup\nclaude() { printf '%s|%s|%s|%s' "\${Q1178_SERVER-absent}" "\${Q1178_DAEMON-absent}" "$Q1178_AUTH" "$Q1178_STARTUP" > ${shellQuote(final)}; }\n`);
+      writeFileSync(rc, `unset HISTFILE\nprintf '%s|%s|%s|%s\\n' "\${Q1178_SERVER-absent}" "\${Q1178_DAEMON-absent}" "\${Q1178_AUTH-absent}" "\${TMUX_PANE-absent}" > ${shellQuote(initial)}\nexport Q1178_STARTUP=startup Q1178_AUTH=startup\nclaude() { printf '%s|%s|%s|%s\\n' "\${Q1178_SERVER-absent}" "\${Q1178_DAEMON-absent}" "$Q1178_AUTH" "$Q1178_STARTUP" > ${shellQuote(final)}; }\n`);
       const custom=`exec /bin/bash --noprofile --rcfile ${shellQuote(rc)} -i`;
       const selected={HOME:home,PATH:process.env.PATH!,OPENRIG_HOME:home,OPENRIG_NODE_ID:"node",OPENRIG_SESSION_NAME:"seat",Q1178_AUTH:"daemon"};
       const baseline={...selected,Q1178_DAEMON:"daemon"};
@@ -72,11 +97,11 @@ describe.skipIf(process.platform === "win32")("#1178 initial-shell environment p
       expect((await adapter.createSession("seat",home,{OPENRIG_NODE_ID:"node",OPENRIG_SESSION_NAME:"seat"})).ok).toBe(true);
       const pane=await tmux(["display-message","-p","-t","=seat:","#{pane_id}"]);
       const inspected=path.join(home,"shell-environment");
-      await tmux(["send-keys","-t","=seat:","-l",`printf '%s|%s|%s' "$Q1178_DAEMON" "\${Q1178_SERVER-absent}" "$TMUX_PANE" > ${shellQuote(inspected)}`]);
+      await tmux(["send-keys","-t","=seat:","-l",`printf '%s|%s|%s\\n' "$Q1178_DAEMON" "\${Q1178_SERVER-absent}" "$TMUX_PANE" > ${shellQuote(inspected)}`]);
       await tmux(["send-keys","-t","=seat:","Enter"]);
       expect(await waitFile(inspected)).toEqual(["daemon","absent",pane]);
       const mode=path.join(home,"login-mode");
-      await tmux(["send-keys","-t","=seat:","-l",`if shopt -q login_shell; then printf login > ${shellQuote(mode)}; else printf nonlogin > ${shellQuote(mode)}; fi`]);
+      await tmux(["send-keys","-t","=seat:","-l",`if shopt -q login_shell; then printf 'login\\n' > ${shellQuote(mode)}; else printf 'nonlogin\\n' > ${shellQuote(mode)}; fi`]);
       await tmux(["send-keys","-t","=seat:","Enter"]);
       expect(await waitFile(mode)).toEqual(["login"]);
     } finally { await tmux(["kill-server"]).catch(()=>{}); rmSync(home,{recursive:true,force:true,maxRetries:5,retryDelay:20}); }
@@ -106,13 +131,39 @@ describe.skipIf(process.platform === "win32")("#1178 initial-shell environment p
       await tmux(["set-option","-g","update-environment","SSH_AUTH_SOCK SSH_ASKPASS Q1178_CUSTOM_UPDATED"]);
       await tmux(["set-option","-g","default-shell","/bin/bash"]);
       const script=path.join(home,"observe.sh");
-      writeFileSync(script,`export HISTFILE=/dev/null\nprintf '%s|%s|%s' "$SSH_AUTH_SOCK" "\${SSH_ASKPASS-absent}" "$Q1178_CUSTOM_UPDATED" > ${shellQuote(observed)}\nexec /bin/bash --noprofile --norc\n`);
+      writeFileSync(script,`export HISTFILE=/dev/null\nprintf '%s|%s|%s\\n' "$SSH_AUTH_SOCK" "\${SSH_ASKPASS-absent}" "$Q1178_CUSTOM_UPDATED" > ${shellQuote(observed)}\nexec /bin/bash --noprofile --norc\n`);
       await tmux(["set-option","-g","default-command",`exec /bin/bash ${shellQuote(script)}`]);
       expect((await adapter.createSession("seat",home,{OPENRIG_NODE_ID:"owned-node"})).ok).toBe(true);
       expect(await waitFile(observed)).toEqual(["/synthetic/daemon-agent.sock","absent","daemon-custom"]);
       expect(await tmux(["show-environment","-g","SSH_AUTH_SOCK"])).toBe("SSH_AUTH_SOCK=/stale/server-agent.sock");
     } finally {await tmux(["kill-server"]).catch(()=>{});vi.unstubAllEnvs();rmSync(home,{recursive:true,force:true,maxRetries:5,retryDelay:20});}
   });
+  it.each([false, true])("a seat keeps its database and tmux directory when inspection fails=%s", async inspectionFails => {
+    const home = mkdtempSync(path.join(tmpdir(), "tmux-instance-")), socket = path.join(home, "owned.sock");
+    const observed = path.join(home, "observed");
+    const env = { ...process.env, HOME: home }; delete env.TMUX; delete env.TMUX_TMPDIR;
+    const tmux = async (args: string[]) => (await exec("tmux", ["-S", socket, ...args], { env })).stdout.trim();
+    const adapter = new TmuxAdapter(async () => "", undefined, args => {
+      if (inspectionFails && args.includes("default-shell")) throw Error("synthetic inspection failure");
+      return tmux(args.slice(1));
+    });
+    const selected = { HOME: home, PATH: process.env.PATH!, OPENRIG_NODE_ID: "owned", OPENRIG_DB: path.join(home, "selected db.sqlite"), TMUX_TMPDIR: path.join(home, "tmux directory") };
+    adapter.launchEnvironment = () => ({ inheritTmuxEnvironment: false, env: selected });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await tmux(["-f", "/dev/null", "new-session", "-d", "-s", "anchor", "sleep 60"]);
+      await tmux(["set-environment", "-g", "OPENRIG_DB", "/stale.sqlite"]);
+      await tmux(["set-environment", "-g", "TMUX_TMPDIR", "/stale-tmux"]);
+      await tmux(["set-option", "-g", "default-shell", "/bin/bash"]);
+      await tmux(["set-option", "-g", "default-command", `printf '%s|%s\\n' "$OPENRIG_DB" "$TMUX_TMPDIR" > ${shellQuote(observed)}; exec /bin/bash --noprofile --norc`]);
+      const result = await adapter.createSession("seat", home, selected);
+      expect(result.ok).toBe(true);
+      expect(result.warnings?.some(w => w.includes("Scoped tmux environment unavailable")) ?? false).toBe(inspectionFails);
+      expect(await waitFile(observed)).toEqual([selected.OPENRIG_DB, selected.TMUX_TMPDIR]);
+      expect(await tmux(["show-environment", "-g", "OPENRIG_DB"])).toBe("OPENRIG_DB=/stale.sqlite");
+    } finally { warn.mockRestore(); await tmux(["kill-server"]).catch(() => {}); rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); }
+  });
+
   it.each(["create","respawn"])("returns the scoped-environment fallback warning to %s callers",async mode=>{
     const adapter=new TmuxAdapter(async()=>"",undefined,async args=>{
       if(args.includes("default-shell"))throw Error("unavailable inspection");

@@ -83,7 +83,8 @@ configurations, as below; do not take the pin from a cached page summary.
 1. **Goal first.** Use a goal and folder already supplied, including a handoff
    from the installing agent; do not ask for them again. If the goal is missing,
    ask once: "What would you like to build or change?" If they already named a
-   team, use it and skip the questions it answers.
+   team, use it and skip the questions it answers. Keep any choice the
+   handoff carries, such as a trust or hook-review prompt they declined.
 2. **Where it works.** If the folder is missing, ask which folder the team should
    work in (usually a clone of their repository) and use its absolute path. Your
    own working directory is OpenRig's workspace, not their project, so never launch with
@@ -157,8 +158,13 @@ configurations, as below; do not take the pin from a cached page summary.
      `rig specs preview <team> --kind rig --json`: draw members and runtimes
      from `graph.nodes` and edges from `graph.edges`, with one line on each
      role. For workshop, draw from its `rig.yaml` at the pinned commit.
-5. **Fit it to their providers.** Infer which tools they have from the
-   kernel's own runtimes (`rig ps --nodes --rig kernel --json`), or ask. Check
+5. **Fit it to their providers.** Start from the choice they made at setup:
+   `rig config get provider.selected` prints `claude`, `codex` or
+   `claude,codex` when `rig setup --providers` recorded one. A kernel that
+   boots after that choice runs only those providers; one that booted earlier
+   keeps its seats (check `rig ps --nodes --rig kernel`). When it's empty,
+   infer which tools they have from
+   the kernel's own runtimes (`rig ps --nodes --rig kernel --json`), or ask. Check
    only the providers the team needs (`claude auth status` or
    `codex login status`). If you run in Claude Code, the kernel launch allows
    both checks; say in one line that it can still ask them to approve it if
@@ -196,11 +202,11 @@ configurations, as below; do not take the pin from a cached page summary.
    --plan` (for workshop, with its `--target ~/rigs/workshop`) and tell them
    what will start: how many agents, which providers, in which folder.
    Say too what launching into their folder changes for their own agent
-   there. A Claude Code team usually adds files such as a `CLAUDE.md`, its
-   skills, `.mcp.json` and `.openrig/`, and its `.claude/settings.local.json`
-   makes their own Claude Code in that folder start in accept-edits mode, with
-   the `exa` and `context7` MCP servers and OpenRig's activity hooks; what a
-   given team writes depends on its configuration. If they'd rather keep
+   there. A Claude Code team usually adds OpenRig's blocks to `CLAUDE.md`,
+   plus `.mcp.json` and `.openrig/`, and its `.claude/settings.local.json`
+   gives their own Claude Code in that folder the `exa` and `context7` MCP
+   servers, OpenRig's activity hooks and its status line; what a given team
+   writes depends on its configuration. `rig setup` lists these writes. If they'd rather keep
    their folder as it is, offer a separate copy, such as a git worktree.
    If the plan declares non-interruptive or broad access, say so plainly before asking for their yes.
    If they keep permission prompts on, say what that will be like before
@@ -208,6 +214,9 @@ configurations, as below; do not take the pin from a cached page summary.
    don't already cover, the asks come often, especially early, and each one
    needs their answer, in the seat's pane or through you. Their yes starts
    the team; it isn't a yes to those later asks.
+   For a team that already exists, `rig seat status <seat>` shows each seat's
+   planned permissions: the native mode, where it comes from, what OpenRig
+   adds and what isn't known. Read it to them as planned, not observed.
    Use `applying-a-permission-policy`; for an unset policy, recommend the team
    default rather than `none`. Starting the team, `rig up` without `--plan`,
    waits on their yes to this plan; a yes they already gave for this same
@@ -215,9 +224,18 @@ configurations, as below; do not take the pin from a cached page summary.
 7. **Report readiness honestly.** Read each seat's `startupStatus` in
    `rig ps --nodes --rig <team> --json`: `pending` means still starting, not
    ready; only `ready` is ready; `attention_required` and `failed` need the
-   person or a fix. If `rig up` reports `Status: partial` with
+   person or a fix. `ready` says the seat started; it can still wait at a
+   prompt afterwards (step 10). If `rig up` reports `Status: partial` with
    `Startup attention (<seat>): <reason>`, tell them what that seat is waiting
    for and the command its reason ends with.
+   A trust, hook-review or permission prompt is theirs to answer, unless an
+   operation they asked for names that prompt and its answer, or they told
+   you outright to decide that kind of prompt (step 10). Your launch
+   grants and the team's default permissions aren't their consent, and a
+   prompt they declined for one seat isn't a yes for another. Pass their
+   answer by step 10's route, then run that command. Until they answer,
+   report the seat as not ready and what it waits on; never answer it with
+   `tmux send-keys`.
    Relay any untracked-file warnings from `rig up` to the person, including the
    paths and suggested local exclude lines. Those files were created by the
    launch, so describe them as OpenRig additions rather than pre-existing work.
@@ -261,7 +279,15 @@ configurations, as below; do not take the pin from a cached page summary.
 10. **Tell them when a seat waits on them.** A team seat waiting at a prompt
     shows `needs_input` as its `agentActivity.state` in
     `rig ps --nodes --rig <team> --json --fields canonicalSessionName,agentActivity,tmuxAttachCommand`,
-    and nothing else tells the person.
+    and nothing else tells the person. The kernel's own seats can wait too,
+    so check them the same way:
+    `rig ps --nodes --rig kernel --json --fields canonicalSessionName,agentActivity,tmuxAttachCommand`.
+    A Claude seat at its usage-limit menu ("What do you want to do?" with
+    "Stop and wait for limit to reset") reads `needs_input` with reason
+    `selection_prompt`: its account is out of usage until the reset the menu
+    names. Tell them it's a usage limit, which seat, and when it resets, with
+    the menu's choices in its own words. One of them may spend usage credits,
+    so the choice is theirs.
     When you see one, tell them where they already are: which seat, what its
     prompt asks (`rig capture <session>` with the seat's
     `canonicalSessionName` shows it) and the seat's `tmuxAttachCommand`, or
@@ -272,7 +298,16 @@ configurations, as below; do not take the pin from a cached page summary.
     offers, in its own words. Take an answer for each one. A "yes to all"
     covers only the prompts you showed; don't choose an option that also
     approves future actions (such as "don't ask again") unless they chose it
-    for that prompt. If they want you to pass an answer on, first capture
+    for that prompt. If they have told you outright to decide a kind of
+    future prompt (say, "approve prompts that only write inside my
+    project"), decide each such prompt when you come across it: read its
+    complete action, answer only when the action is clearly inside what they
+    said, and send the answer as below with their instruction as the
+    `--reason`, never as a new yes from them. Bring anything unclear or
+    outside it back to them; a command's name or a path that looks like
+    their project doesn't show what the action touches. Their instruction
+    changes no permission setting.
+    If they want you to pass an answer on, first capture
     that seat again and check its prompt still asks the same action with the
     same choices; if it changed, don't reuse the old answer. Then send exactly
     their choice to that seat with
@@ -296,6 +331,50 @@ Avoid these:
   adapt the team instead;
 - starting the team in your own working directory instead of their folder;
 - asking for the goal twice: the lead gets it from you.
+
+## A person's modes
+
+A mode is a named bundle of three settings a person agrees with you: availability
+(whether they'll answer, and when they're back), decision room (what the team may
+decide for them meanwhile) and delivery (quiet hours, and where their account
+goes when they're back). The commands are `rig gateway human mode save | saved |
+apply | current | end | account`; `--help` on each has the details.
+
+**The first time** someone asks for a mode they haven't set up ("I'm going to
+sleep"), say it isn't set up yet and explain, before anything applies:
+- what each of the three settings would be, and what it would actually do;
+- that permission prompts don't change;
+- what they'll be told when they're back.
+
+Propose conservative settings: no decision room unless they state one, in their
+own words, with any exclusions. Never infer a room from the mode's name or a
+recommended option. Ask "Use this, or change something?" Save and apply only once
+they agree. A later use applies the saved mode and reads it back in a line or two.
+
+**Coming back.** When they say they're back (`mode end`), or a scheduled end
+arrives (you get a queue row for it), read the facts first:
+`rig gateway human mode account <entityId> <applicationId>`. Then say, from those
+facts only:
+- which mode was on and the settings in effect;
+- which of its effects ended;
+- which newer choices of theirs stand (an effect that's `kept`);
+- anything pending or failed;
+- the mode they're in now (at desk when none).
+
+Never say "back to normal" while a `kept`, `pending` or `failed` effect remains.
+Then give the account where the mode's delivery says:
+- each decision made for them, with how to revisit it, and plainly which can't
+  be undone; "nothing was decided for you" when there were none;
+- what's waiting, valid apart from stale (with the reason), and anything still
+  held by quiet hours;
+- what the account can't tell them (`notTracked`), said as such.
+
+Nothing is reported as done, decided or resolved that the facts don't show.
+
+**A known refusal:** someone with only the old `away: true` flag on their record
+and no availability set can't have a mode applied that sets another
+availability; that effect fails. Say so plainly, and offer to clear the flag
+with their agreement (`rig gateway human set <entityId> away false`).
 
 ## What you do NOT do
 

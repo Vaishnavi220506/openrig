@@ -10,8 +10,9 @@ import {
   getDaemonUrl,
   startDaemon,
   waitForKernelReady,
-  type LifecycleDeps,
-} from "../daemon-lifecycle.js";
+  type LifecycleDeps, daemonStatusGuard } from "../daemon-lifecycle.js";
+import { shouldAutoStartDaemon } from "../daemon-reachability.js";
+import { freshSeatCommand, launchFreshSeat } from "../fresh-seat-command.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 
@@ -203,7 +204,8 @@ status); a restore that returned without a ready kernel exits 1.
 
       // ---- PHASE 1: ensure daemon is running ----
       let status = await getDaemonStatus(deps.lifecycleDeps);
-      if (status.state !== "running") {
+      // A busy daemon of this home gets the request instead of a start attempt (shouldAutoStartDaemon).
+      if (shouldAutoStartDaemon(status)) {
         if (!opts.json) console.log("Starting daemon...");
         try {
           const { ConfigStore } = await import("../config-store.js");
@@ -258,11 +260,7 @@ status); a restore that returned without a ready kernel exits 1.
         }
       }
 
-      if (status.state !== "running" || status.healthy === false) {
-        console.error("Daemon is not healthy. Check with: rig daemon status");
-        process.exitCode = 1;
-        return;
-      }
+      if (!daemonStatusGuard(status)) return;
 
       const baseUrl = getDaemonUrl(status);
       const client = deps.clientFactory(baseUrl);
@@ -308,7 +306,8 @@ status); a restore that returned without a ready kernel exits 1.
       // Verify UI is actually serving before announcing the URL.
       let uiUrl: string | null = null;
       try {
-        const healthRes = await fetch(`${baseUrl}/healthz`);
+        // Bounded like any request: a daemon that never answers must not hold the start here.
+        const healthRes = await fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(5_000) });
         if (healthRes.ok) {
           uiUrl = baseUrl;
         }
@@ -552,8 +551,8 @@ status); a restore that returned without a ready kernel exits 1.
           if (!opts.json) {
             console.log(`  ${rigName}: ${rigResult ?? resStatus}`);
             for (const n of nodes) {
-              if (n.status === "awaiting-decision" && n.error) {
-                console.log(`    ${n.logicalId}: awaiting-decision -- ${n.error}`);
+              if ((n.status === "awaiting-decision" || n.status === "left_attached") && n.error) {
+                console.log(`    ${n.logicalId}: ${n.status} -- ${n.error}`);
               } else {
                 console.log(`    ${n.logicalId}: ${n.status}`);
               }
@@ -573,27 +572,14 @@ status); a restore that returned without a ready kernel exits 1.
                 if (yes) accepted.push(n.logicalId);
               }
               if (accepted.length > 0) {
-                try {
-                  const freshRes = await client.post<Record<string, unknown>>(
-                    `/api/rigs/${encodeURIComponent(rigId)}/up`,
-                    { plan: false, freshLogicalIds: accepted },
-                    { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS },
-                  );
-                  if (freshRes.status >= 400) {
-                    const freshError = String(freshRes.data["error"] ?? "fresh-prime failed");
-                    console.error(`    Fresh-prime for ${rigName}: ${freshError} (HTTP ${freshRes.status})`);
-                  } else {
-                    const freshNodes = (freshRes.data["nodes"] as Array<{ logicalId: string; status: string }>) ?? [];
-                    for (const fn of freshNodes.filter((fn) => accepted.includes(fn.logicalId))) {
-                      if (!opts.json) console.log(`    ${fn.logicalId}: ${fn.status}`);
-                    }
-                  }
-                } catch (err) {
-                  if (err instanceof DaemonConnectionError) {
-                    console.error(`    Fresh-prime timed out for ${rigName}; the daemon may still be processing. Verify with: rig ps`);
-                  } else {
-                    throw err;
-                  }
+                // Each accepted seat starts alone, as the printed command does: a whole-rig restore naming it
+                // is refused while the siblings this restore resumed are running.
+                for (const id of accepted) {
+                  const launched = await launchFreshSeat(client, id, rigName);
+                  // --json keeps stdout for the result; a refusal still reaches stderr.
+                  if (opts.json && launched.ok) continue;
+                  (launched.ok ? console.log : console.error)(`    ${id}: ${launched.message}`);
+                  if (launched.guidance) console.error(`      ${launched.guidance}`);
                 }
               } else if (!opts.json) {
                 console.log(`    No fresh sessions started for ${rigName}.`);
@@ -601,7 +587,7 @@ status); a restore that returned without a ready kernel exits 1.
             } else {
               // Headless: report honestly, no auto-substitute.
               for (const n of awaiting) {
-                if (!opts.json) console.error(`    ${n.logicalId}: awaiting-decision -- to fresh-prime: rig up --existing ${rigName} --fresh ${n.logicalId}`);
+                if (!opts.json) console.error(`    ${n.logicalId}: awaiting-decision -- to fresh-prime: ${freshSeatCommand(n.logicalId, rigName)}`);
               }
             }
           }
@@ -655,7 +641,9 @@ function keptDownEntry(c: StartCandidate): { rigName: string; restoreCommand: st
 
 function summarizeReadiness(c: StartCandidate): string {
   if (!c.preview) return "";
-  const actions = c.preview.nodes.map((n) => n.intendedAction);
+  // A seat left attached is restore's to leave alone, so it doesn't change the rig's readiness.
+  const actions = c.preview.nodes.map((n) => n.intendedAction).filter((a) => a !== "leave-attached");
+  if (actions.length === 0) return "[left attached]";
   if (actions.every((a) => a === "resume-original")) return "[ready to resume]";
   if (actions.some((a) => a === "awaiting-decision")) return "[will ask before fresh]";
   if (actions.every((a) => a === "fresh-primed")) return "[fresh start]";

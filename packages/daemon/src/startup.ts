@@ -1,5 +1,7 @@
+import { TerminalPolicyStore } from "./domain/terminal-policy.js";
+import { daemonDatabaseWarnings } from "./daemon-db-path.js";
 import { physicalSessionName } from "./domain/session-registry.js";
-import { makeWatchdogDeliver, occurrenceAttempted, priorDigestAttempt } from "./domain/watchdog-delivery.js";
+import { makeWatchdogDeliver } from "./domain/watchdog-delivery.js";
 import { fileURLToPath } from "node:url";
 import { discoverTailscaleSelfNames } from "./middleware/browser-boundary.js";
 import { configureShadowCapture } from "./domain/shadow-capture.js";
@@ -22,8 +24,10 @@ import { migrate } from "./db/migrate.js";
 import { ALL_MIGRATIONS } from "./db/all-migrations.js";
 import { RigRepository } from "./domain/rig-repository.js";
 import { SessionRegistry } from "./domain/session-registry.js";
+import { NativePermissionStore } from "./domain/native-permission-store.js";
 import { deriveCanonicalSessionName, isHumanSeatSessionRef, parseSessionName } from "./domain/session-name.js";
 import { resolveExternal } from "./domain/gateway/external-admission.js";
+import { makeTopologyDestinationCheck } from "./domain/queue-destination-check.js";
 import { loadHumanRegistry } from "./domain/gateway/human-registry.js";
 import { EventBus } from "./domain/event-bus.js";
 import { NodeLauncher } from "./domain/node-launcher.js";
@@ -85,6 +89,7 @@ import { LegacyBundleSourceResolver as BundleSourceResolver } from "./domain/bun
 import { PodBundleSourceResolver } from "./domain/bundle-source-resolver.js";
 import { PsProjectionService } from "./domain/ps-projection.js";
 import { SeatActivityService } from "./domain/seat-activity-service.js";
+import { restoredRunnerHookEvidence } from "./routes/activity.js";
 import { readClaudeSelfReportEvidence } from "./adapters/claude-code-adapter.js";
 import { replaceFile } from "./adapters/replace-file.js";
 import { SeatStructuralActivityService } from "./domain/seat-structural-activity-service.js";
@@ -183,6 +188,7 @@ import { homeIsolationAdvisory } from "./domain/home-isolation.js";
 import { materializeBuiltinPolicyReference } from "./domain/builtin-policy-reference.js";
 import { withCommunityHarnessResolver, withCommunityHarnesses } from "./adapters/community-harness-runtime-adapter.js";
 import { ensureActivityHookToken, writeActivityEndpointFile, deriveActivityUrl, readActivityEndpointFile } from "./domain/activity-endpoint.js";
+import { recoverSeatSkillAttempts } from "./domain/seat-skill-apply.js";
 import { restoreExistingRigUnattended } from "./domain/existing-rig-restore.js";
 import {
   getCompatibleOpenRigPath,
@@ -313,6 +319,14 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // Only the explicit selection overrides a pane rc or the legacy PID-home
   // reader. The resolved default remains the writer/network-reader/session root.
   const dbPath = opts?.dbPath ?? ":memory:";
+  const seatDbPath = dbPath === ":memory:" ? dbPath : nodePath.resolve(dbPath);
+  const allowDbConflict = process.env.OPENRIG_ALLOW_DB_CONFLICT === "1";
+  delete process.env.OPENRIG_ALLOW_DB_CONFLICT; // this boot only; never pass the go-ahead to seats
+  const databaseWarnings = await daemonDatabaseWarnings(dbPath, OPENRIG_HOME,
+    process.env.OPENRIG_DB === dbPath ? "OPENRIG_DB" : process.env.RIGGED_DB === dbPath ? "RIGGED_DB" : undefined,
+    { conflictPolicy: new ContextPackSettingsStore().resolveOne("daemon.db_conflict").value as string,
+      allowConflict: allowDbConflict });
+  for (const warning of databaseWarnings) console.warn(`Warning: ${warning}`);
   const db = createDb(dbPath);
   migrate(db, ALL_MIGRATIONS);
 
@@ -375,31 +389,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   } catch (error) {
     console.error("[slow-operation] setDegradedHandler registration failed", error);
   }
-  // PL-004 Phase A revision (R1): topology-backed validateRig.
-  // Reject `<member>@<unknown-rig>` shapes against the rig registry.
-  // Bare ids without `@` are also rejected
-  // (no canonical rig binding).
-  // OPR.0.4.6.MH1 FR-8: this gate is the ARCHETYPE consumer of the shared
-  // parse contract — human-seat classification BEFORE parse, then the
-  // greedy first-@ rig (so "member@rig@x" looks up rig "rig@x", misses,
-  // and rejects with the same unknown_destination_rig as ever — BR-1).
-  const topologyValidateRig = (sessionRef: string): boolean => {
-    const parsed = parseSessionName(sessionRef);
-    // M1 A4b — @external entity-admission (checked BEFORE the human-CLASS bare-admit,
-    // which A2 also makes true for <local>@external): a queue row destinationed to
-    // <local>@external is admitted ONLY if the human is REGISTERED (or it is a literal
-    // scheme address); an unregistered entity is REFUSED (the 4b site carries the
-    // entity-level teaching via externalAdmissionTeaching). Admission is the gateway's
-    // job, never the classifier's (arch 8cd30094).
-    if (parsed.kind === "external") {
-      const reg = loadHumanRegistry();
-      const entities = reg.ok ? reg.entities.map((e) => ({ entityId: e.entityId, address: e.address })) : [];
-      return resolveExternal(parsed.local, entities).kind !== "unregistered";
-    }
-    if (isHumanSeatSessionRef(sessionRef)) return true;
-    if (parsed.kind !== "canonical") return false;
-    return rigRepo.findRigsByName(parsed.rig).length > 0;
-  };
+  // PL-004 Phase A revision (R1): topology-backed validateRig (queue-destination-check.ts has the rule).
+  const topologyValidateRig = makeTopologyDestinationCheck({
+    findRigsByName: (name) => rigRepo.findRigsByName(name),
+    loadHumanRegistry: () => loadHumanRegistry(),
+  });
   // Seat absence in positively known local topology is advice, never admission
   // authority. Keep every typed destination intact, including adopted aliases.
   const topologyDestinationAdvisory = (sessionRef: string) => {
@@ -462,6 +456,21 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // db.transaction commits atomically with the close + successor create.
   const outboxHandlerInstance = new OutboxHandler(db);
   queueRepoInstance.attachOutbox(outboxHandlerInstance);
+  // Reconcile only the prior process's claims, before transport/producers/timers can start new sends.
+  let reconciledWakeIntents = 0;
+  try {
+    reconciledWakeIntents = queueRepoInstance.reconcileAbandonedWakeIntents();
+  } catch (err) {
+    console.warn(`wake-intent claim recovery: failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // OPR.0.7.0.13: a seat skill list attempt a previous process left mid-send becomes indeterminate, never resent. Like the
+  // wake-intent claims above, it is settled before this process can start new attempts.
+  try {
+    const seatSkillAttempts = recoverSeatSkillAttempts(db);
+    if (seatSkillAttempts) console.log(`seat skill list recovery: ${seatSkillAttempts} interrupted attempt(s) marked indeterminate, not resent`);
+  } catch (err) {
+    console.warn(`seat skill list recovery: failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
   // PL-004 Phase B — classifier lease manager. Constructed early so both
   // the leaseManager dep slot and project-classifier can share one instance.
   // isAlive is post-attached after whoami-service is constructed.
@@ -546,6 +555,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const sessionsDir = nodePath.join(process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(os.homedir(), ".claude"), "sessions");
       return readClaudeSelfReportEvidence({ sessionsDir, sessionName, seatNodeId });
     },
+    // pi and omp: after a restart, a runner seat takes its last recorded hook (current session and generation only).
+    restoreHookEvidence: (seat, runtime) => restoredRunnerHookEvidence(agentActivityStore, seat, runtime),
   });
   // 5b82324b — the STRUCTURAL activity cache (sibling of SeatActivityService). Captures pane TEXT once
   // per running seat per tick + classifies motion STRUCTURALLY, so the `rig ps` ACTIVITY column reflects
@@ -610,6 +621,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const launchSessionEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH,
     OPENRIG_HOME,
+    OPENRIG_DB: seatDbPath,
+    TMUX_TMPDIR: process.env.TMUX_TMPDIR,
     OPENRIG_PORT: openRigPort,
     OPENRIG_HOST: openRigHost,
     OPENRIG_URL: resolvedActivityHookUrl,
@@ -723,13 +736,24 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const rigs = rigRepo.listRigs();
   let reconcileChecked = 0;
   let reconcileDetached = 0;
+  let reconcileUnseen = 0;
   let reconcileErrors = 0;
   for (const rig of rigs) {
     try {
       const result = await reconciler.reconcile(rig.id);
       reconcileChecked += result.checked;
       reconcileDetached += result.detached;
+      reconcileUnseen += result.unseen.length;
       reconcileErrors += result.errors.length;
+      for (const u of result.unseen) {
+        try {
+          // eslint-disable-next-line no-console
+          console.warn(`startup reconcile: ${u.sessionName} isn't on this daemon's tmux server, but its last observed process ${u.pid} is still running`
+            + `${u.parent ? ` (parent process ${u.parent.pid}: ${u.parent.command.slice(0, 160)})` : ""}, so it was left as it was: not marked`
+            + ` detached and not relaunched. The daemon is probably using a different tmux server from its seats (it didn't inherit their`
+            + ` TMUX). Restart the daemon from inside the seats' tmux server, or with TMUX set to it.`);
+        } catch { /* logging must never throw */ }
+      }
       for (const e of result.errors) {
         try {
           // eslint-disable-next-line no-console
@@ -746,7 +770,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   }
   try {
     // eslint-disable-next-line no-console
-    console.log(`startup reconcile: rigs=${rigs.length} checked=${reconcileChecked} detached=${reconcileDetached} errors=${reconcileErrors}`);
+    console.log(`startup reconcile: rigs=${rigs.length} checked=${reconcileChecked} detached=${reconcileDetached} unseen=${reconcileUnseen} errors=${reconcileErrors}`);
   } catch { /* logging must never throw */ }
 
   // Transcript rotators are process-local. Reattach them after lifecycle
@@ -842,7 +866,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
   const startupOrchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter, readFile: (p: string) => fs.readFileSync(p, "utf-8") });
   const runtimeSettings = new ContextPackSettingsStore().resolveConfig();
-  const claudeAdapter = new ClaudeCodeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, claudeManagedLaunch, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), copyFile: replaceFile, listFiles: (dir: string) => { const r: string[] = []; /** Collect relative file paths recursively. */ function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, readdir: (dir: string) => fs.readdirSync(dir), statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: os.homedir() }, stateDir: OPENRIG_HOME, collectorAssetPath: nodePath.resolve(import.meta.dirname, "../assets/claude-statusline-context.cjs"), autoDriveProviderPrompts: runtimeSettings.recoveryAutoDriveProviderPrompts, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"), claudeHooksManifestPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/claude.json"), recordProjection: (targetPath: string, content: string) => projectionManifestStore.record({ targetPath, lastHash: hashContent(content), writtenAt: new Date().toISOString() }) });
+  const claudeAdapter = new ClaudeCodeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, claudeManagedLaunch, resolvePermissionMode: (nodeId: string) => new NativePermissionStore(db).resolve(nodeId, "claude-code").permissionMode, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), copyFile: replaceFile, listFiles: (dir: string) => { const r: string[] = []; /** Collect relative file paths recursively. */ function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, readdir: (dir: string) => fs.readdirSync(dir), statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: os.homedir() }, stateDir: OPENRIG_HOME, collectorAssetPath: nodePath.resolve(import.meta.dirname, "../assets/claude-statusline-context.cjs"), autoDriveProviderPrompts: runtimeSettings.recoveryAutoDriveProviderPrompts, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"), claudeHooksManifestPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/claude.json"), recordProjection: (targetPath: string, content: string) => projectionManifestStore.record({ targetPath, lastHash: hashContent(content), writtenAt: new Date().toISOString() }) });
   const codexAdapter = new CodexRuntimeAdapter({ prepareTeamWorkspace, tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; /** Collect relative file paths recursively. */ function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: daemonHome }, codexHome: configuredCodexHome, launchPath: process.env.PATH, detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome), readNetworkDefault: readCodexNetworkDefault, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"), resolveCorePluginDir: () => vendoredCorePluginDir(), resolveCorePluginSelected: (nodeId: string) => Boolean(seatCodexCorePluginDir({ id: nodeId, runtime: "codex" }, db)), resolveHooksEnabled: async () => {
     const { SettingsStore } = await import("./domain/user-settings/settings-store.js");
     return new SettingsStore().resolveOne("runtime.codex.hooks_enabled").value as boolean;
@@ -898,6 +922,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const realFs = {
       readFile: (p: string) => fs.readFileSync(p, "utf-8"),
       writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"),
+      copyFileExclusive: (src: string, dest: string) => fs.copyFileSync(src, dest, fs.constants.COPYFILE_EXCL),
       exists: (p: string) => fs.existsSync(p),
       mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
       listFiles: (dir: string) => {
@@ -1285,15 +1310,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       });
     });
   }
-  const { SeatAttentionReconciler } = await import("./domain/seat-attention-reconciler.js");
+  const { SeatAttentionReconciler, attentionProbeSend } = await import("./domain/seat-attention-reconciler.js");
   const seatAttentionReconciler = new SeatAttentionReconciler({
     sessionRegistry, eventBus, agentActivityStore, db, tmux: tmuxAdapter,
     reconcileRestoreOutcome: (rigId, nodeId) => restoreOrchestrator.reconcileNodeRuntimeTruth(rigId, nodeId),
-    sendVerify: async (session, text, opts) => {
-      const transport = deps.sessionTransport;
-      if (!transport) return { ok: false, outcome: "failed" };
-      return transport.send(session, text, { verify: opts?.verify });
-    },
+    sendVerify: attentionProbeSend(() => deps.sessionTransport),
     capture: async (session, opts) => {
       const transport = deps.sessionTransport;
       if (!transport) return { ok: false, sessionName: session, error: "transport_unavailable" };
@@ -1307,6 +1328,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
 
   const deps: AppDeps = {
+    databaseWarnings,
     rigRepo,
     sessionRegistry,
     daemonLifecycleStore,
@@ -1919,10 +1941,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // built, those scopes honestly return not-found rather than throwing.
   {
     const { TerminalService } = await import("./domain/terminal/terminal-service.js");
-    const { HerdrAdapter } = await import("./domain/terminal/herdr-adapter.js");
-    const { createHerdrSocketRpc, createHerdrSocketTransport, resolveHerdrSocketPath } = await import(
-      "./domain/terminal/herdr-transport.js"
-    );
+    const { createHerdrProviders } = await import("./domain/terminal/herdr-sessions.js");
     const { CmuxProviderAdapter } = await import("./domain/terminal/cmux-provider-adapter.js");
     const { CmuxLayoutService } = await import("./domain/cmux-layout-service.js");
     const { TerminalViewsStore } = await import("./domain/terminal/terminal-views-store.js");
@@ -1948,12 +1967,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       logicalId: e.logicalId,
     });
 
-    const herdrSocketPath = resolveHerdrSocketPath();
-    const herdrProvider = new HerdrAdapter({
-      // FB4: herdr speaks its unix control socket (there is no `layout` CLI).
-      transportFactory: createHerdrSocketTransport(createHerdrSocketRpc(herdrSocketPath)),
-      launch: { socketPath: herdrSocketPath, ...(process.env["HERDR_SESSION"] ? { session: process.env["HERDR_SESSION"] } : {}) },
-    });
+    const { defaultProvider: herdrProvider, sessionProvider: herdrSessionProvider } = createHerdrProviders();
     const cmuxProvider = new CmuxProviderAdapter({
       cmuxAdapter,
       // One gridded workspace per composed page — the same grid machinery as
@@ -1967,6 +1981,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
     deps.terminalService = new TerminalService({
       resolveProvider: (name) => providerMap[name] ?? null,
+      resolveSessionProvider: (name, session) => name === "herdr" ? herdrSessionProvider(session) : null,
       viewsStore: new TerminalViewsStore(),
       listRigSeatsBatch: (names) => {
         const rigs = rigRepo.listRigs();
@@ -2121,8 +2136,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       eventBus,
       deliver: makeWatchdogDeliver({
         sessionTransport,
-        outbox: outboxHandlerInstance,
-        db,
+        hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         createContinuityAction: (action) => createContinuityCutoverBaton(action, queueRepoInstance).then(() => {}),
       }),
       // (i-c) fire-time target-generation gate: resolve the target's LIVE occupant-generation (P12
@@ -2130,6 +2144,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // UNKNOWN (null) fails open → deliver. A drop of this line disables the gate silently (gen-bound
       // wakes would fire at the successor) — pinned in watchdog-target-gen-wiring.test.ts.
       resolveTargetGeneration: (s) => sessionRegistry.currentOccupantGenerationForSession(s),
+      // Issue #1180 — sampled context use for token/percent context watchdogs,
+      // generation-guarded against a predecessor's frozen telemetry.
+      resolveContextUsage: (s, occupantGeneration) =>
+        watchdogJobsRepoInstance.findContextUsageForSession(s, occupantGeneration),
       resolvePreDeliveryTerminalReason: ({ jobId }) =>
         queueRepoInstance.resolveWatchdogPreDeliveryTerminalReason(jobId),
       resolveQueueWait: (input) => queueRepoInstance.evaluateWaitReminder(input),
@@ -2138,8 +2156,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       },
       // Due parked-row reminders for one seat in one scheduler pass go as one message.
       resolveDigestEntry: ({ jobId, message }) => queueRepoInstance.parkReminderDigestEntry(jobId, message),
-      priorDigestAttempt: (occurrenceId) => priorDigestAttempt(outboxHandlerInstance, occurrenceId),
-      occurrenceAttempted: (occurrenceId) => occurrenceAttempted(outboxHandlerInstance, occurrenceId),
       // PL-004 Phase D: register workflow-keepalive policy alongside
       // Phase C's three built-in policies. workflow-keepalive reads
       // SQLite workflow_instances directly via the new Phase D tables
@@ -2162,9 +2178,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         // parked diagnosis (diagnoseRigParked over the arbitrated oracle +
         // destination-scoped obligations + wake status; the same derivation
         // `rig parked` serves) consumed by one rig-level supervisor job.
-        // Episode receipts are TRANSITIONS on the obligation row, written
-        // reserve-before-deliver (the retention active-frontier invariant is
-        // the durability proof); watchdog history is telemetry only.
+        // Attempt notes preserve prompt-refusal recovery; neither notes nor history suppress current reminders.
         makeParkedOwnerConsumerPolicy({
           diagnoseRig: (rigName) => {
             const seats = db
@@ -2195,9 +2209,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             listForJob: (jobId, limit) => watchdogHistoryLogInstance.listForJob(jobId, limit),
             countForJob: (jobId) => watchdogHistoryLogInstance.countForJob(jobId),
           },
-          // R2 repair: the durable row-side surfaces. Receipts are transitions on
-          // the obligation row (reserve-before-deliver); failures land in the
-          // ladder's native last_nudge_result vocabulary.
+          // Best-effort attempt reporting; actual prompt and failure recovery still use the existing ladder.
           rows: {
             recoveryOwnsWake: (qitemId) => queueRecoveryOwnsWake(db, queueRepoInstance.getById(qitemId)),
             listTransitions: (qitemId: string) =>
@@ -2220,6 +2232,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
               queueRepoInstance.listOpenObligations(destinationSession, 500).map((r) => r.qitemId),
           },
           occupantGeneration: (sessionName) => sessionRegistry.currentOccupantGenerationForSession(sessionName),
+          // The enforcer is constructed below; read its shared instance at evaluation time.
+          hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         }),
         // OPR.0.5.6.1 AM-F1 — the delivery engine's two timing legs on THIS
         // substrate. The gateway dispatch binds late (the subsystem is built
@@ -2253,6 +2267,25 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             return fn(op, ref, payload, opts);
           },
         }),
+        // Quiet hours: one release job per quiet window posts what was held, once quiet is off, through the same gateway.
+        (await import("./domain/policies/quiet-release.js")).makeQuietReleasePolicy({
+          queueRepo: queueRepoInstance,
+          jobsRepo: watchdogJobsRepoInstance,
+          registry: { loadHumanRegistry: (home: string) => loadHumanRegistryForDelivery(home) },
+          home: OPENRIG_HOME,
+          dispatch: (op: string, ref: string, payload: unknown, opts?: { decisionId?: string }) => {
+            const fn = lateGatewayDispatch.fn;
+            if (!fn) return { ok: false, error: "gateway not yet active" };
+            return fn(op, ref, payload, opts);
+          },
+        }),
+        // A person's mode ends at the scheduled end they chose, on the same clock.
+        (await import("./domain/policies/mode-scheduled-end.js")).makeModeScheduledEndPolicy({
+          db,
+          queueRepo: queueRepoInstance,
+          jobsRepo: watchdogJobsRepoInstance,
+          home: OPENRIG_HOME,
+        }),
       ],
     });
     queueRepoInstance.startWaitReminders();
@@ -2268,8 +2301,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // ensured idempotently on the (policy, target_session) tuple; the anchor is
     // `parked-owner-consumer@<rigName>` (member@rig shape, policy name as the
     // member slug). activeWakeIntervalSeconds stays NULL so the engine never
-    // throttles one seat's wake because another fired — per-seat dedup lives in
-    // the durable episode receipts. Rigs created after startup are BORN ARMED:
+    // throttles one seat's wake because another fired. Only recorded success to
+    // the same known occupant with unchanged rows suppresses a repeat; failed,
+    // unknown or unrecorded attempts remain eligible. Prompt recovery stays with the ladder. Rigs created after startup are BORN ARMED:
     // rigRepo.onRigCreated (wired below) runs the same ensure in the creation
     // act itself (the birth-property ruling) — no restart wait, no watcher.
     {
@@ -2320,7 +2354,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // hardcoded); oversight = the fleet judgment seat, locally resolvable or a NAMED deferral
     // (no daemon-side cross-host send seam exists yet — the deferral names that, never silence).
     {
-      const { ModelDivergenceMonitor } = await import("./domain/model-divergence/model-divergence-monitor.js");
+      const { ModelDivergenceMonitor, proclaimedInEventLog } = await import("./domain/model-divergence/model-divergence-monitor.js");
       const OVERSIGHT_SEAT = "watch-lead@oversight";
       const modelDivergenceMonitor = new ModelDivergenceMonitor({
         processCensus: modelCensus,
@@ -2342,7 +2376,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           try {
             const previous = deliveryId ? outboxHandlerInstance.getById(deliveryId) : null;
             const payload = previous?.guardBinding ? previous.body : message;
-            const result = await sessionTransport.send(target, payload, { deliveryId, actorSession: "model-monitor@system", auditPointer: deliveryId });
+            const result = await sessionTransport.send(target, payload, { deliveryId, actorSession: "model-monitor@system", openrigNotice: true, auditPointer: deliveryId });
             return result.ok ? { ok: true, outcome: result.outcome } : { ok: false, error: result.error };
           } catch (err) {
             return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -2371,9 +2405,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             pinnedModel: proclamation.pinnedModel,
             effectiveModel: proclamation.effectiveModel,
             diagnosis: proclamation.diagnosis,
+            occurrenceId: proclamation.occurrenceId,
             channels: proclamation.channels,
           });
         },
+        wasProclaimed: proclaimedInEventLog(db),
       });
       modelDivergenceMonitor.startPolling(60_000);
       deps.modelDivergenceMonitor = modelDivergenceMonitor;
@@ -2412,10 +2448,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // No periodic timer (ruled out of scope): a transient failure lands the row
     // in a VISIBLE state and is retried on the next start.
     try {
-      // BLOCKING 1: reconcile abandoned `sending` claims (a prior crash) FIRST,
-      // then drain committed `pending` intents. Reconcile is a one-time boundary
-      // step, separate from the drain.
-      const reconciled = queueRepoInstance.reconcileAbandonedWakeIntents();
+      // Prior-process claims were reconciled before current-process producers started.
+      const reconciled = reconciledWakeIntents;
       const drained = await queueRepoInstance.drainPendingWakeIntents();
       if (drained.delivered || drained.indeterminate || drained.failed || reconciled) {
         console.log(
@@ -2444,6 +2478,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         // so a stage minted by a retired generation is refused for the successor. null = UNKNOWN → the
         // gate is inert (never compares a stale generation as if live).
         {
+          terminalPolicies: new TerminalPolicyStore(db),
           resolveOccupantGeneration: (sessionName) =>
             sessionRegistry.currentOccupantGenerationForSession(sessionName),
           onPostRestoreComplete: (receipt) => {
@@ -2489,8 +2524,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   deps.occupantInvalidator = new DefaultOccupantInvalidator({
     enforcer: compactionEnforcer ?? { invalidateOccupant: () => {} },
     contextUsage: contextUsageStore,
-    // (e/Class-B) watchdog store — armed jobs registered by the retiring generation stop at swap.
+    // (e/Class-B) watchdog store — armed jobs the retiring generation registered for its own seat stop at swap.
     watchdog: watchdogJobsRepoInstance,
+    // The names that reach a seat, so a job addressed to its logical or physical spelling counts as its own.
+    addresses: sessionRegistry,
     // (e/Class-B) queue store — in-progress items claimed by the retiring generation release to pending.
     queue: queueRepoInstance,
     log: (msg) => console.warn(msg),

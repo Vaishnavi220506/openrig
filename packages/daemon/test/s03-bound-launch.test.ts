@@ -84,7 +84,7 @@ describe("S03 production managed capability selection", () => {
       process: { env: { PATH: f.env.PATH, ...names, UNRELATED_VALUE: "not-forwarded" } },
       OPENRIG_HOME: f.env.OPENRIG_HOME, openRigPort: "1", openRigHost: "127.0.0.1",
       resolvedActivityHookUrl: "http://127.0.0.1:1", resolvedActivityHookToken: "synthetic-only",
-      providerAuthEnv: {}, daemonHome: f.env.HOME, codexHome: path.join(f.root, "codex"),
+      providerAuthEnv: {}, daemonHome: f.env.HOME, codexHome: path.join(f.root, "codex"), seatDbPath: path.join(f.root, "instance.sqlite"),
     });
     for (const key of Object.keys(f.env)) delete f.env[key];
     Object.assign(f.env, sessionEnv);
@@ -167,7 +167,7 @@ if (process.argv.includes('--help')) {
     const command = prepared.command([]);
     for (const key of ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
       "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY"]) {
-      expect(command).toContain(`\${${key}:+"${key}=$${key}"}`);
+      expect(command).toContain(`if [ -n "\${${key}-}" ]; then export ${key}; else unset ${key}; fi`);
     }
     expect(command).not.toContain("UNAPPROVED_RENDERER_VALUE");
     expect(command).not.toMatch(/TMUX/);
@@ -269,7 +269,7 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     expect(cmd).toContain("(/*) printf %s");
     expect(cmd).toContain("(?*) if [");
     expect(cmd).not.toMatch(/(^|\s)\$\(/);
-    expect(cmd).toContain('${__openrig_wayland_display:+"WAYLAND_DISPLAY=$__openrig_wayland_display"}');
+    expect(cmd).toContain('export WAYLAND_DISPLAY="$__openrig_wayland_display"');
   });
   it.each(["fresh", "resume", "fork", "legacy"])("names the editor and display session variables on a %s launch", async kind => {
     const f = fixture();
@@ -282,8 +282,8 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
         ...(kind === "fork" ? { forkSource: { kind: "native_id" as const, value: token } } : {}) });
     expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
     const cmd = f.calls[0]!;
-    for (const key of sessionNames) expect(cmd).toContain(`\${${key}:+"${key}=$${key}"}`);
-    expect(cmd).toContain('"WAYLAND_DISPLAY=$__openrig_wayland_display"');
+    for (const key of sessionNames) expect(cmd).toContain(`if [ -n "\${${key}-}" ]; then export ${key}; else unset ${key}; fi`);
+    expect(cmd).toContain('export WAYLAND_DISPLAY="$__openrig_wayland_display"');
     // XDG_RUNTIME_DIR is read to resolve WAYLAND_DISPLAY, never forwarded as a variable.
     expect(cmd).not.toMatch(/XDG_RUNTIME_DIR=\$|"XDG_RUNTIME_DIR=/);
     for (const key of withheldNames.filter(key => key !== "XDG_RUNTIME_DIR")) expect(cmd).not.toContain(key);
@@ -343,6 +343,33 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
 });
 
 describe("S03 bound launch across existing paths", () => {
+  it.skipIf(process.platform === "win32").each(["managed", "classic"].flatMap(mode => ["fresh", "resume", "fork", "legacy"].map(kind => ({ mode, kind }))))("executes the seat's literal Advisor argument on $mode $kind and omits it for a peer", async ({ mode, kind }) => {
+    const f = fixture();
+    const native = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    writeFileSync(f.executable, `#!${process.execPath}\nconsole.log(process.argv.includes('--help') ? ${JSON.stringify(help)} : JSON.stringify(process.argv.slice(2)));\n`);
+    vi.mocked(execFile).mockImplementation(native.execFile);
+    vi.spyOn(f.adapter as any, "verifyResumeLaunch").mockResolvedValue({ ok: true });
+    const resume = new ClaudeResumeAdapter(f.tmux, { claudeManagedLaunch: f.managed });
+    vi.spyOn(resume as any, "verifyResume").mockResolvedValue({ ok: true });
+    const advisor = "opus'; $(exit 99)";
+    const binding = { ...f.binding, advisor: ` ${advisor} `, effort: "medium", permissionMode: mode === "managed" ? "auto" : undefined };
+    const result = kind === "legacy"
+      ? await resume.resume("seat", "claude_id", "prior-id", f.cwd, "floor", binding.model, binding.permissionMode, "node", "medium", undefined, undefined, undefined, binding.advisor)
+      : await f.adapter.launchHarness(binding, { name: "seat", ...(kind === "resume" ? { resumeToken: "prior-id" } : {}),
+        ...(kind === "fork" ? { forkSource: { kind: "native_id" as const, value: "prior-id" } } : {}) });
+    expect(result).toMatchObject({ ok: true });
+    const argv = JSON.parse(native.execFileSync("/bin/sh", ["-c", f.calls[0]!], { cwd: f.cwd, env: f.env, encoding: "utf8", timeout: 3000 })) as string[];
+    expect(argv.slice(argv.indexOf("--advisor"), argv.indexOf("--advisor") + 2)).toEqual(["--advisor", advisor]);
+    expect(argv.slice(argv.indexOf("--model"), argv.indexOf("--model") + 2)).toEqual(["--model", binding.model]);
+    expect(argv.slice(argv.indexOf("--effort"), argv.indexOf("--effort") + 2)).toEqual(["--effort", "medium"]);
+    if (kind === "fresh") expect(argv).toContain("--session-id");
+    else expect(argv.slice(argv.indexOf("--resume"), argv.indexOf("--resume") + 2)).toEqual(["--resume", "prior-id"]);
+    expect(argv.includes("--fork-session")).toBe(kind === "fork");
+    await f.adapter.launchHarness({ ...f.binding, permissionMode: binding.permissionMode }, { name: "peer" });
+    const peer = JSON.parse(native.execFileSync("/bin/sh", ["-c", f.calls[1]!], { cwd: f.cwd, env: f.env, encoding: "utf8", timeout: 3000 })) as string[];
+    expect(peer).not.toContain("--advisor");
+  });
+
   it.each(["fresh", "resume", "fork", "legacy"])("uses the same context and quotes every argument on %s", async kind => {
     const f = fixture();
     vi.spyOn(f.adapter as any, "verifyResumeLaunch").mockResolvedValue({ ok: true });
@@ -356,7 +383,7 @@ describe("S03 bound launch across existing paths", () => {
     expect(f.calls).toHaveLength(1); const cmd = f.calls[0]!;
     expect(cmd).toContain("/usr/bin/env -i"); expect(cmd).toContain("'--permission-mode' 'auto'");
     expect(cmd).toContain("'OPENRIG_OCCUPANT_GENERATION=generation-1'"); expect(cmd).toContain("'model'\"'\"'s choice'");
-    expect(cmd).toContain('"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}"'); expect(cmd).not.toContain(f.env.ANTHROPIC_API_KEY);
+    expect(cmd).toContain('export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY-}"'); expect(cmd).not.toContain(f.env.ANTHROPIC_API_KEY);
     expect(cmd).toContain("'" + f.executable.replaceAll("'", "'\"'\"'") + "'");
     if (kind !== "fresh") expect(cmd).toContain("'history'\"'\"'s id; literal'");
     expect(f.tmux.sendText).not.toHaveBeenCalled(); expect(f.tmux.sendKeys).not.toHaveBeenCalled(); expect(execFile).toHaveBeenCalledOnce();
