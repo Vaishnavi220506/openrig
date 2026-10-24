@@ -101,7 +101,8 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
         if (mode === "ambiguous-pane") paneTargets.push(`pid:${target}`);
         return mode === "wrong-pane" && target === "%1" ? 999 : 100;
       },
-      getPaneCommand: async () => {
+      getPaneCommand: async (target: string) => {
+        if (mode === "ambiguous-pane") paneTargets.push(`command:${target}`);
         if (["pane-command-unavailable", "unknown-both"].includes(mode)) throw new Error("fixture command unavailable");
         return mode === "versioned-direct-pane" ? "2.1.285" : "sh";
       },
@@ -134,7 +135,8 @@ it.each(modes)("selector and ordinary transport: %s", async (mode) => {
     const sent = await transport.send(name, "harmless fixture message");
     if (mode === "ambiguous-pane") {
       expect(paneTargets).toContain("pid:%1");
-      expect(paneTargets.every(target => !target.endsWith("%2"))).toBe(true);
+      expect(paneTargets.length).toBeGreaterThan(0);
+      expect(paneTargets.every(target => target.endsWith("%1"))).toBe(true);
     }
     const expectedSend = [
       "npm-name", "versioned", "pane-command-unavailable", "unknown-both", "versioned-direct-pane",

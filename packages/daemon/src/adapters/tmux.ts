@@ -1248,7 +1248,7 @@ export class TmuxAdapter {
 
   /** Leave the pane's current mode (copy mode) with `send-keys -X cancel`, through the same input guard as sendKeys. */
   async cancelPaneMode(target: string): Promise<TmuxResult> {
-    return this.guardedInput(target, (pane, beforeWrite) => { beforeWrite(); return this.sendKeysUnchecked(pane, ["-X", "cancel"]); });
+    return this.guardedInput(target, (pane, beforeWrite) => { beforeWrite(); return this.sendKeysUnchecked(pane, ["-X", "cancel"]); }, false, "keys");
   }
 
   /** A launch metadata read. Callers must never put credential values in terminal input. */

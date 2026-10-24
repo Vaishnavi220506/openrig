@@ -701,6 +701,7 @@ export async function probeSessionActivity(input: {
       evidence: null,
     };
   }
+  const readTarget = binding?.pane ?? sessionName;
   if (attachmentType === "external_cli") {
     return {
       state: "unknown",
@@ -712,7 +713,7 @@ export async function probeSessionActivity(input: {
   }
   if (runtime === "terminal") {
     try {
-      const paneCommand = await tmuxAdapter.getPaneCommand(sessionName);
+      const paneCommand = await tmuxAdapter.getPaneCommand(readTarget);
       if (paneCommand && !IDLE_TERMINAL_COMMANDS.has(paneCommand)) {
         return {
           state: "running",
@@ -784,8 +785,8 @@ export async function probeSessionActivity(input: {
   const captureSeq = observed ? nextCaptureSeq++ : 0;
   try {
     const capture = (opts?: { escapeSequences?: boolean }) => visibleScreenOnly
-      ? opts ? tmuxAdapter.capturePaneScreen(sessionName, opts) : tmuxAdapter.capturePaneScreen(sessionName)
-      : opts ? tmuxAdapter.capturePaneContent(sessionName, 20, opts) : tmuxAdapter.capturePaneContent(sessionName, 20);
+      ? opts ? tmuxAdapter.capturePaneScreen(readTarget, opts) : tmuxAdapter.capturePaneScreen(readTarget)
+      : opts ? tmuxAdapter.capturePaneContent(readTarget, 20, opts) : tmuxAdapter.capturePaneContent(readTarget, 20);
     const snapshot = input.composerSnapshot ? await input.composerSnapshot().catch(() => null) : null;
     const paneContent = snapshot?.screen ?? await capture();
     const capturedAt = new Date().toISOString();
@@ -3142,7 +3143,7 @@ export class SessionTransport {
         // falls back to the count below.
         const inputBox = boxBefore && inputBoxRuntime
           ? await this.inputBoxEvidence(sessionName, readTarget, sessionMeta, boxBefore, readInputBox(content, inputBoxRuntime, text, boxBefore.pane))
-          : inputBoxRuntime && promptOverride ? INPUT_BOX_UNCHECKED : undefined;
+          : undefined;
         // With the setting on, only a seat proven idle before the paste and input-box evidence verify: exact before
         // Enter, empty after, same process. A not-idle or unknown seat always reads unconfirmed.
         const verified = inputBoxRuntime
