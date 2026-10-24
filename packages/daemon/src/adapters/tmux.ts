@@ -5,7 +5,7 @@ import { join as pathJoin } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ComposerSnapshot } from "../domain/composer-prompts.js";
 import { inspectComposerInput } from "../domain/session-transport.js";
-import { parentSessionEnvKeys } from "../domain/parent-session-env.js";
+import { parentSessionEnvKeys, removeParentSessionEnv } from "../domain/parent-session-env.js";
 import type { TmuxControlExec } from "./tmux-control.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
@@ -29,7 +29,7 @@ interface TmuxShellCommandOptions {
 export type ArgvExecFn = (argv: string[]) => Promise<string>;
 
 /**
- * Injectable file/buffer operations for `sendText`.
+ * Injectable file/buffer operations for terminal payloads and launch environments.
  * Split out so tests can observe temp-file writes and unique-name generation
  * without touching the real filesystem; production wires node fs + os.tmpdir.
  */
@@ -66,8 +66,11 @@ export function defaultTmuxFileOps(): TmuxFileOps {
 }
 
 export type TmuxResult =
-  | { ok: true; warnings?: string[] }
-  | { ok: false; code: string; message: string };
+  | { ok: true; warnings?: string[]; stopPhase?: StopPhase }
+  | { ok: false; code: string; message: string; stopPhase?: StopPhase };
+
+/** Furthest external stop boundary reached; an attempted command can have an uncertain effect. */
+export type StopPhase = "none" | "detach_attempted" | "detached" | "kill_attempted";
 
 export interface TmuxSession {
   name: string;
@@ -249,6 +252,13 @@ function shellQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\"'\"'") + "'";
 }
 
+/** tmux config joins physical newlines even inside single quotes. Encode multiline words
+ * with its double-quoted escapes instead of passing shell syntax to source-file. */
+function tmuxConfigQuote(s: string): string {
+  if (!s.includes("\n")) return shellQuote(s);
+  return '"' + s.replace(/[\\"$\n\r\t]/g, c => ({ "\\": "\\\\", '"': '\\"', "$": "\\$", "\n": "\\n", "\r": "\\r", "\t": "\\t" })[c]!) + '"';
+}
+
 /**
  * An exact tmux target for a session name. tmux resolves a bare name by prefix when no session has that exact name,
  * so a read or pipe for a session that just ended would act on another (`dev-impl@my-rig` on `dev-impl@my-rig2`).
@@ -343,6 +353,49 @@ function parseLines<T>(output: string, parser: (line: string) => T | null): T[] 
 }
 
 export class TmuxAdapter {
+  /** Read for each new agent/successor. Unconfigured adapters retain legacy behavior. */
+  launchEnvironment?: () => { inheritTmuxEnvironment: boolean; env: Readonly<Record<string, string | undefined>> };
+
+  /** Reset before the selected user shell runs, without changing the server or other sessions.
+   * Multiple tmux command arguments execute directly; only this fixed non-interactive sh runs
+   * before env -i. Generated pane metadata must come from this spawn, never daemon TMUX values.
+   * Keep the configured default-command and default-shell lookup, including rc functions.
+   */
+  private async scopedLaunchCommand(seatEnv: Record<string, string>, command?: string, warnings: string[] = []): Promise<string[] | null> {
+    if (!this.launchEnvironment || !seatEnv.OPENRIG_NODE_ID) return null;
+    try {
+      const policy = this.launchEnvironment();
+      if (policy.inheritTmuxEnvironment) return null;
+      if (process.platform === "win32") throw new Error("POSIX launch boundary unavailable");
+      const shell = await this.getDefaultShell();
+      if (!shell) throw new Error("Default shell unavailable");
+      if (command === undefined) command = (await this.run(["tmux", "show-options", "-gv", "default-command"])).replace(/\r?\n$/, "");
+      // tmux normally copies these client values from the daemon on new-session.
+      // Read its configured names, but never reuse values stored on the server.
+      const updated = (await this.run(["tmux", "show-options", "-gv", "update-environment"]))
+        .trim().split(/\s+/).filter(key => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key));
+      const baseline = { ...Object.fromEntries(updated.map(key => [key, process.env[key]])), ...policy.env };
+      removeParentSessionEnv(baseline);
+      const values = Object.entries({ ...baseline, ...seatEnv })
+        .filter((entry): entry is [string,string] => entry[1] !== undefined && !["TMUX", "TMUX_PANE", "TERM", "SHELL"].includes(entry[0]))
+        .map(([key,value]) => {
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error("Invalid environment name");
+          return `export ${key}=${shellQuote(value)}`;
+        });
+      const file = this.fileOps.tmpName();
+      // Builtin exports keep values off env/sh argv; the pane owns removal once started.
+      await this.fileOps.writeFile(file, `/bin/rm -f -- ${shellQuote(file)}\n${values.join("\n")}\nexec "$@"\n`, { mode: 0o600, flag: "wx" });
+      const reset = 'exec /usr/bin/env -i -- TMUX="$TMUX" TMUX_PANE="$TMUX_PANE" TERM="$TERM" SHELL="$SHELL" /bin/sh "$@"';
+      return ["/bin/sh", "-c", reset, "sh", file, shell, ...(command ? ["-c", command] : ["-l"])];
+    } catch {
+      // Keep the working launch, with a diagnostic; this option is not a new admission gate.
+      const warning = "Scoped tmux environment unavailable; retaining the previous environment for this launch.";
+      warnings.push(warning);
+      console.warn(`[seat launch] ${warning}`);
+      return null;
+    }
+  }
+
   private inputGuard?: SeatDeliveryGuard;
   get deliveryGuard(): SeatDeliveryGuard | undefined { return this.inputGuard; }
   set deliveryGuard(guard: SeatDeliveryGuard | undefined) {
@@ -446,7 +499,7 @@ export class TmuxAdapter {
           throw error;
         }
         const pane = fresh ? created.pane : bound.pane;
-        if (!pane || panes.length !== 1 || panes[0]!.id !== pane) throw new Error("Managed pane identity unavailable or changed; no input written.");
+        if (!pane || panes.length !== 1 || panes[0]!.id !== pane) throw new Error("Managed pane identity unavailable or changed; no input written. If the seat's pane was never recorded, rig reconcile-session <seat> --repair-missing-pane --no-launch fills it (with typing protection off).");
         if (inputKind === "control" && guard.needsInputCheck(identity)) await guard.beforeInput(identity);
         if (inputKind === "respawn" && guard.needsInputCheck(identity)) {
           if (!guard.ownsLifecycle(bound.nodeId) || !await this.isPaneDead(pane)) {
@@ -490,6 +543,18 @@ export class TmuxAdapter {
   private async run(argv: string[], legacy?: string): Promise<string> {
     if (this.argvExec) return this.argvExec(argv);
     return this.exec(legacy ?? posixJoinArgv(argv));
+  }
+
+  /** Environment-bearing commands travel in a private config, never a client's argv.
+   * Values stay in tmux's session environment, including for later panes. No global mutation.
+   * A failed/uncertain call retains its private file: it may not have been consumed yet.
+   */
+  private async runEnvironmentCommand(argv: string[], legacy?: string, startServer = false): Promise<string> {
+    const file = this.fileOps.tmpName();
+    await this.fileOps.writeFile(file, (legacy ?? posixJoinArgv(argv)).slice("tmux ".length) + "\n", { mode: 0o600, flag: "wx" });
+    const output = await this.run(["tmux", ...(startServer ? ["start-server", ";"] : []), "source-file", file]);
+    await this.fileOps.unlink(file).catch(() => {});
+    return output;
   }
 
   /** Ends the daemon's tmux control client, and with it its session (tmux-control.ts), when tmux is driven through one. */
@@ -634,13 +699,16 @@ export class TmuxAdapter {
     for (const [k, v] of Object.entries(seatEnv)) argv.push("-e", `${k}=${v}`);
     // The pane new-session itself made: an after-new-session hook may select another window.
     argv.push("-P", "-F", "#{pane_id}");
-    const legacyParts = ["tmux", "new-session", "-d", "-s", shellQuote(name)];
-    if (cwd != null) legacyParts.push("-c", shellQuote(cwd));
-    for (const [k, v] of Object.entries(seatEnv)) legacyParts.push("-e", shellQuote(`${k}=${v}`));
-    legacyParts.push("-P", "-F", shellQuote("#{pane_id}"));
+    const legacyParts = ["tmux", "new-session", "-d", "-s", tmuxConfigQuote(name)];
+    if (cwd != null) legacyParts.push("-c", tmuxConfigQuote(cwd));
+    for (const [k, v] of Object.entries(seatEnv)) legacyParts.push("-e", tmuxConfigQuote(`${k}=${v}`));
+    legacyParts.push("-P", "-F", tmuxConfigQuote("#{pane_id}"));
+    const warnings: string[] = [];
+    const scopedCommand = await this.scopedLaunchCommand(seatEnv, undefined, warnings);
+    if (scopedCommand) { argv.push(...scopedCommand); legacyParts.push(...scopedCommand.map(tmuxConfigQuote)); }
     let created: string;
     try {
-      created = (await this.run(argv, legacyParts.join(" "))).trim();
+      created = (await this.runEnvironmentCommand(argv, legacyParts.join(" "), true)).trim();
     } catch (err) {
       return classifyWriteError(err);
     }
@@ -649,15 +717,15 @@ export class TmuxAdapter {
     // and restart the fresh pane so its shell starts without it. The session
     // exists either way, so a failure here is a warning, never a failed launch.
     try {
-      if (await this.excludeParentSessionEnv(exactTarget(name, "session"), Object.keys(seatEnv))) {
+      if (await this.excludeParentSessionEnv(exactTarget(name, "session"), Object.keys(seatEnv)) && !scopedCommand) {
         if (!/^%\d+$/.test(created)) throw new Error(`new-session reported no pane id ("${created}"), so no pane was restarted`);
         const respawn = ["tmux", "respawn-pane", "-k", "-t", created];
         if (cwd != null) respawn.push("-c", cwd);
         await this.run(respawn, posixJoinArgv(respawn));
       }
-      return { ok: true };
+      return warnings.length ? { ok: true, warnings } : { ok: true };
     } catch (err) {
-      return { ok: true, warnings: [parentSessionEnvWarning(name, err)] };
+      return { ok: true, warnings: [...warnings, parentSessionEnvWarning(name, err)] };
     }
   }
 
@@ -693,13 +761,14 @@ export class TmuxAdapter {
    * buffer leaks. Unique temp + buffer names per call keep parallel `rig up`
    * seats from colliding.
    */
-  async sendText(target: string, text: string, beforeInput?: () => void, options?: { bracketed?: boolean }): Promise<TmuxResult> {
+  async sendText(target: string, text: string, beforeInput?: () => void, options?: { bracketed?: boolean; beforePaste?: () => Promise<void> }): Promise<TmuxResult> {
     return this.guardedInput(target, (pane, beforeWrite) => {
       const guard = this.deliveryGuard;
       const identity = this.freshManaged.get(target)?.nodeId ?? target;
-      const policy = guard?.needsInputCheck(identity) ? {
-        beforePaste: () => guard.beforeInput(identity),
-        afterPaste: () => guard.notePasted(identity, text),
+      const checkDraft = guard?.needsInputCheck(identity);
+      const policy = checkDraft || options?.beforePaste ? {
+        beforePaste: async () => { if (checkDraft) await guard!.beforeInput(identity); await options?.beforePaste?.(); },
+        afterPaste: async () => { if (checkDraft) await guard!.notePasted(identity, text); },
       } : undefined;
       return this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed, policy);
     }, false, "text");
@@ -864,28 +933,35 @@ export class TmuxAdapter {
     }
   }
 
-  async killSession(name: string): Promise<TmuxResult> {
+  /** With a delivery guard, terminate by immutable tmux session ID; checked callers validate before detach and kill. */
+  async killSession(name: string, beforeEffect?: () => void): Promise<TmuxResult> {
+    let stopPhase: StopPhase = "none";
     if (this.deliveryGuard) {
-      return this.guardedInput(name, async pane => {
+      const result = await this.guardedInput(name, async (pane, beforeWrite) => {
         const stdout = await this.run(["tmux", "display-message", "-p", "-t", pane, "#{session_id}"], `tmux display-message -p -t ${shellQuote(pane)} '#{session_id}'`);
         const sessionId = stdout.trim();
         if (!/^\$\d+$/.test(sessionId)) return { ok: false, code: "guard_target_unknown", message: "Cannot establish immutable session identity; no session killed." };
         const kill = async () => {
-          const result = await this.killSessionUnchecked(sessionId);
+          const result = await this.killSessionUnchecked(sessionId, beforeEffect && (() => { beforeWrite(); beforeEffect(); }), phase => { stopPhase = phase; });
           if (result.ok) { this.freshProbes.delete(name); this.freshProbes.delete(pane); this.freshManaged.delete(name); }
           return result;
         };
         if (this.freshProbes.get(name) === pane && !this.deliveryGuard!.maybeTarget(name) && !this.deliveryGuard!.maybeTarget(pane)) return kill();
         return this.deliveryGuard!.input(this.freshManaged.get(name)?.nodeId ?? name, kill);
       }, true);
+      return beforeEffect ? { ...result, stopPhase } : result;
     }
+    if (beforeEffect) return { ok: false, code: "guard_unavailable", message: "Checked stop requires the delivery guard.", stopPhase };
     return this.killSessionUnchecked(name);
   }
 
-  private async killSessionUnchecked(name: string): Promise<TmuxResult> {
+  /** Keep effect checks outside command catches so a selection refusal retains its code and phase. */
+  private async killSessionUnchecked(name: string, beforeEffect?: () => void, phase?: (value: StopPhase) => void): Promise<TmuxResult> {
     // The guarded path passes the immutable `$N` id, which stays as it is; a bare name is made exact.
     const session = exactTarget(name, "session");
     // Detach first so `detach-on-destroy off` cannot switch views onto another session.
+    beforeEffect?.();
+    phase?.("detach_attempted");
     try {
       await this.run(["tmux", "detach-client", "-s", session],
         `tmux detach-client -s ${shellQuote(session)}`);
@@ -894,6 +970,9 @@ export class TmuxAdapter {
       const message = err instanceof Error ? err.message : String(err);
       if (!message.toLowerCase().includes("no current client")) return classifyWriteError(err);
     }
+    phase?.("detached");
+    beforeEffect?.();
+    phase?.("kill_attempted");
     try {
       await this.run(["tmux", "kill-session", "-t", session],
         `tmux kill-session -t ${shellQuote(session)}`);
@@ -944,24 +1023,29 @@ export class TmuxAdapter {
     const argv = ["tmux", "respawn-pane", "-t", exact];
     if (opts?.cwd != null) argv.push("-c", opts.cwd);
     if (opts?.env) for (const [k, v] of Object.entries(opts.env)) argv.push("-e", `${k}=${v}`);
-    // The respawn command is ONE argv unit: tmux runs it via the shell.
-    if (command != null && command.length > 0) argv.push(command);
-    const legacyRespawn = ["tmux", "respawn-pane", "-t", shellQuote(exact)];
-    if (opts?.cwd != null) legacyRespawn.push("-c", shellQuote(opts.cwd));
-    if (opts?.env) for (const [k, v] of Object.entries(opts.env)) legacyRespawn.push("-e", shellQuote(`${k}=${v}`));
-    if (command != null && command.length > 0) legacyRespawn.push(shellQuote(command));
+    const warnings: string[] = [];
+    const scopedCommand = await this.scopedLaunchCommand(opts?.env ?? {}, command, warnings);
+    // Legacy commands remain one argument; the scoped wrapper executes directly before the user shell.
+    if (scopedCommand) argv.push(...scopedCommand);
+    else if (command != null && command.length > 0) argv.push(command);
+    const quote = opts?.env && Object.keys(opts.env).length ? tmuxConfigQuote : shellQuote;
+    const legacyRespawn = ["tmux", "respawn-pane", "-t", quote(exact)];
+    if (opts?.cwd != null) legacyRespawn.push("-c", quote(opts.cwd));
+    if (opts?.env) for (const [k, v] of Object.entries(opts.env)) legacyRespawn.push("-e", quote(`${k}=${v}`));
+    if (scopedCommand) legacyRespawn.push(...scopedCommand.map(quote));
+    else if (command != null && command.length > 0) legacyRespawn.push(quote(command));
     // The successor starts from the session environment: exclude inherited
     // parent-session identity there first (sessions made before this existed).
     // A failure here is a warning; the respawn goes ahead as it did before.
-    let warnings: string[] | undefined;
     try {
       await this.excludeParentSessionEnv(exact, Object.keys(opts?.env ?? {}));
     } catch (err) {
-      warnings = [parentSessionEnvWarning(exact, err)];
+      warnings.push(parentSessionEnvWarning(exact, err));
     }
     try {
-      await this.run(argv, legacyRespawn.join(" "));
-      return warnings ? { ok: true, warnings } : { ok: true };
+      if (opts?.env && Object.keys(opts.env).length) await this.runEnvironmentCommand(argv, legacyRespawn.join(" "));
+      else await this.run(argv, legacyRespawn.join(" "));
+      return warnings.length ? { ok: true, warnings } : { ok: true };
     } catch (err) {
       return classifyWriteError(err);
     }
@@ -1021,6 +1105,39 @@ export class TmuxAdapter {
     } catch {
       return null;
     }
+  }
+
+  /** The pane's history rows alone and its whole text (history and visible screen), both with wrapped lines joined,
+   *  from one chained tmux call. Through tmux control mode the commands run one at a time, so the pane can change
+   *  between the two captures. `history` is empty when the pane has no history. Null when unreadable. */
+  async capturePaneHistoryParts(paneTarget: string): Promise<{ history: string; all: string } | null> {
+    const exact = exactTarget(paneTarget, "pane");
+    const nonce = randomUUID().replace(/-/g, "");
+    const mark = (k: number) => `__openrig_capture_${nonce}_${k}__`;
+    const argv = ["tmux",
+      "display-message", "-p", "-t", exact, `${mark(0)}#{history_size}`, ";",
+      "capture-pane", "-p", "-J", "-t", exact, "-S", "-", "-E", "-1", ";",
+      "display-message", "-p", "-t", exact, mark(1), ";",
+      "capture-pane", "-p", "-J", "-t", exact, "-S", "-", "-E", "-"];
+    const legacy = `tmux display-message -p -t ${shellQuote(exact)} ${shellQuote(`${mark(0)}#{history_size}`)}`
+      + ` \\; capture-pane -p -J -t ${shellQuote(exact)} -S - -E -1`
+      + ` \\; display-message -p -t ${shellQuote(exact)} ${shellQuote(mark(1))}`
+      + ` \\; capture-pane -p -J -t ${shellQuote(exact)} -S - -E -`;
+    let output: string;
+    try {
+      output = await this.run(argv, legacy);
+    } catch {
+      return null;
+    }
+    const lines = output.split("\n");
+    const first = lines.findIndex((line) => line.startsWith(mark(0)));
+    const second = lines.indexOf(mark(1));
+    if (first < 0 || second < first) return null;
+    const historySize = Number.parseInt(lines[first]!.slice(mark(0).length), 10);
+    if (!Number.isInteger(historySize) || historySize < 0) return null;
+    // With no history, `-E -1` is outside the pane and tmux may return a screen row instead.
+    const history = historySize === 0 ? "" : lines.slice(first + 1, second).join("\n");
+    return { history, all: lines.slice(second + 1).join("\n") };
   }
 
   /** Signal one process by pid. signalPaneProcess signals the pane's root, which in a shell-backed pane is
@@ -1147,13 +1264,12 @@ export class TmuxAdapter {
     }
   }
 
-  /** Set one variable in a session's environment: what its next spawned process inherits, not a
-   *  running one. Callers that pass a value are putting it on a tmux command line. */
+  /** Set one variable for later panes, through the same private-file channel as launch. */
   async setSessionEnv(session: string, key: string, value: string): Promise<void> {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error("Invalid session environment key.");
     const target = exactTarget(session, "session");
-    await this.run(["tmux", "set-environment", "-t", target, key, value],
-      `tmux set-environment -t ${shellQuote(target)} ${shellQuote(key)} ${shellQuote(value)}`);
+    await this.runEnvironmentCommand(["tmux", "set-environment", "-t", target, key, value],
+      `tmux set-environment -t ${tmuxConfigQuote(target)} ${tmuxConfigQuote(key)} ${tmuxConfigQuote(value)}`);
   }
 
   /** Remove one variable from a session's environment, so a process spawned there afterwards
@@ -1350,11 +1466,11 @@ export class TmuxAdapter {
    * screen, NOT `-S -<lines>` scrollback: scrollback reintroduces the row drift
    * the absolute-paint seed exists to eliminate.
    */
-  async capturePaneScreen(paneId: string, escapeSequences = false): Promise<string | null> {
+  async capturePaneScreen(paneId: string, opts?: { escapeSequences?: boolean }): Promise<string | null> {
     const target = exactTarget(paneId, "pane");
     try {
-      const output = await this.run(["tmux", "capture-pane", "-p", ...(escapeSequences ? ["-e"] : []), "-t", target],
-        `tmux capture-pane -p${escapeSequences ? " -e" : ""} -t ${shellQuote(target)}`);
+      const output = await this.run(["tmux", "capture-pane", "-p", ...(opts?.escapeSequences ? ["-e"] : []), "-t", target],
+        `tmux capture-pane -p${opts?.escapeSequences ? " -e" : ""} -t ${shellQuote(target)}`);
       return output || null;
     } catch {
       return null;
@@ -1366,7 +1482,7 @@ export class TmuxAdapter {
     try {
       const before = await this.getPaneCursorPosition(paneId);
       if (!before) return null;
-      const screen = await this.capturePaneScreen(paneId, true);
+      const screen = await this.capturePaneScreen(paneId, { escapeSequences: true });
       if (screen === null) return null;
       const mode = (await this.run(["tmux", "display-message", "-p", "-t", exactTarget(paneId, "pane"), "#{pane_in_mode}"])).trim();
       const after = await this.getPaneCursorPosition(paneId);

@@ -11,14 +11,17 @@ import { classifyPaneRuntimeMatch } from "./seat-identity-reconciler.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { explainNativeRejection, subtreeNamesClaudeExecutable, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyClaudePaneProcess, verifyClaudePaneRuntime, verifyCodexPaneProcess, verifyPaneIdleShell, type NativeProcessRow, type NativeProcessLister, type ClaudeResumeRotation, findExactNativeResumeProcess, listNativeProcesses } from "./native-process-lineage.js";
 import { isShellForeground } from "./shell-classifier.js";
-import { agentAppOf } from "./built-in-runtimes.js";
-import { sessionAgentAppSelect } from "./session-registry.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { readReadyFreshLaunchFences } from "./fresh-occupant-relation.js";
 
 type PaneIdentityTmux = Pick<TmuxAdapter, "listPanes" | "getPanePid" | "getPaneCommand">;
 type ProcessRow = NativeProcessRow;
 
 export type PaneIdentityReconcileResult =
-  | { ok: true; pane: string; pid: number; command: string | null }
+  /** `nativeProcess`: the native runtime process the check matched, when it matched one (Codex, an exact-resume
+   *  Claude). A caller that holds an earlier proof of a process compares against it (#1524). */
+  | { ok: true; pane: string; pid: number; command: string | null; nativeProcess?: { pid: number; startedAt?: string } }
   | { ok: false; detail: string };
 
 /** The rotation recorded with the node's current stored token, when the caller is checking that
@@ -234,11 +237,11 @@ export async function rebindAndVerifyPaneIdentity(input: {
   const runtimeAmbiguous = input.runtime === "codex" || claudeProcessProof ? lineageMatch === null : runtimeMatch === "match" && (strictNativeLineage
     ? lineageMatch === null
     : input.runtime === "claude-code" && !normalizedCommand.includes("claude"));
-  // A community agent app's live pane is never proof of which session it runs. Only a session launched for that app
+  // A community harness's live pane is never proof of which session it runs. Only a session launched for that app
   // counts: the selection recorded on the session being rebound.
-  const selected = (input.db.prepare(`SELECT ${sessionAgentAppSelect(input.db, "sessions")} AS agent_app FROM sessions WHERE node_id = ? AND session_name = ? ORDER BY id DESC LIMIT 1`)
-    .get(input.nodeId, input.sessionName) as { agent_app: string | null } | undefined)?.agent_app;
-  const unconfirmed = pid !== null && runtimeMatch !== "mismatch" && !runtimeAmbiguous && !!agentAppOf(selected, input.runtime);
+  const selected = (input.db.prepare(`SELECT ${sessionCommunityHarnessSelect(input.db, "sessions")} AS community_harness FROM sessions WHERE node_id = ? AND session_name = ? ORDER BY id DESC LIMIT 1`)
+    .get(input.nodeId, input.sessionName) as { community_harness: string | null } | undefined)?.community_harness;
+  const unconfirmed = pid !== null && runtimeMatch !== "mismatch" && !runtimeAmbiguous && !!communityHarnessOf(selected, input.runtime);
   const verdict: SeatIdentityVerdict = {
     nodeId: input.nodeId,
     verdict: pid === null
@@ -257,6 +260,7 @@ export async function rebindAndVerifyPaneIdentity(input: {
     evidence: {
       registeredPane: pane.id,
       observedPid: lineageMatch?.pid ?? pid,
+      observedPanePid: pid,
       observedCommand: lineageMatch?.command ?? command,
       matchedLayer: pid === null || runtimeAmbiguous || unconfirmed ? null : 1,
     },
@@ -305,7 +309,8 @@ export async function rebindAndVerifyPaneIdentity(input: {
       detail: `tmux pane '${printable(pane.id)}' foreground command '${printable(command ?? "unknown")}' contradicts runtime '${input.runtime ?? "unknown"}'`,
     };
   }
-  return { ok: true, pane: pane.id, pid: pid!, command };
+  return { ok: true, pane: pane.id, pid: pid!, command,
+    ...(lineageMatch ? { nativeProcess: { pid: lineageMatch.pid, ...(lineageMatch.startedAt ? { startedAt: lineageMatch.startedAt } : {}) } } : {}) };
 }
 
 export interface ClearAttentionResult {
@@ -337,6 +342,20 @@ export interface SendVerifyFn {
   (sessionName: string, text: string, opts?: { verify?: boolean }): Promise<{ ok: boolean; outcome?: string; verified?: boolean }>;
 }
 
+/** The liveness probe's send through the transport: OpenRig's own message. Where the seat's interruption level would
+ *  hold it, it isn't sent: a held probe proves nothing and would only fill the seat's held messages. */
+export function attentionProbeSend(transport: () => {
+  retentionTarget(session: string, input?: { source: "openrig" | "agent"; urgent: boolean }): unknown;
+  send(session: string, text: string, opts: { verify?: boolean; openrigNotice?: true }): Promise<{ ok: boolean; outcome?: string; verified?: boolean }>;
+} | undefined): SendVerifyFn {
+  return async (session, text, opts) => {
+    const t = transport();
+    if (!t) return { ok: false, outcome: "failed" };
+    if (t.retentionTarget(session, { source: "openrig", urgent: false })) return { ok: false, outcome: "failed" };
+    return t.send(session, text, { verify: opts?.verify, openrigNotice: true });
+  };
+}
+
 export interface CaptureFn {
   (sessionName: string, opts?: { lines?: number }): Promise<{ ok: boolean; sessionName: string; content?: string; error?: string }>;
 }
@@ -358,7 +377,8 @@ interface ClearAttentionDeps {
         to: "operator_recovered";
         evidence: { tmux: boolean; fgProcess: string; resumeTokenUsed: boolean; paneState: "usable" };
       }
-    | { ok: false; code: string; detail: string }
+    | { ok: false; code: string; detail: string; attemptId?: number;
+        probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   >;
 }
 
@@ -368,6 +388,7 @@ const POSITIVE_STATES = new Set(["running", "idle"]);
 type DerivedAttentionOutcome = {
   status: "failed" | "attention_required";
   source: "restore.completed" | "restore.subset_completed";
+  assistedStartupAttemptId?: number;
 };
 
 export class SeatAttentionReconciler {
@@ -398,15 +419,26 @@ export class SeatAttentionReconciler {
     }
 
     const previousError = session.latestError ?? null;
+    const assistedRestore = opts?.reason && session.startupStatus === "attention_required" && !identityClassActive
+      ? derivedOutcome?.assistedStartupAttemptId : undefined;
 
     // Full-restore outcomes belong to one immutable attempt. Generic activity,
     // send verification, and operator attestation cannot prove that lineage;
     // delegate to the restore owner that checks the exact native resume token
     // and appends the attempt-scoped reconciliation event. Subset restores do
     // not have a restore.started receipt and retain their established path.
-    if (derivedOutcome?.source === "restore.completed") {
+    if (derivedOutcome?.source === "restore.completed" && assistedRestore === undefined) {
       const reconcile = this.deps.reconcileRestoreOutcome;
       if (!reconcile) {
+        eventBus.emit({
+          type: "seat.attention_clear_refused",
+          rigId: session.rigId,
+          nodeId: session.nodeId,
+          sessionId: session.id,
+          sessionName,
+          attentionClass: "restore_outcome",
+          code: "strict_reconciler_unavailable",
+        });
         return {
           ok: false,
           code: "not_demonstrably_responsive",
@@ -415,6 +447,17 @@ export class SeatAttentionReconciler {
       }
       const restored = await reconcile(session.rigId, session.nodeId);
       if (!restored.ok) {
+        eventBus.emit({
+          type: "seat.attention_clear_refused",
+          rigId: session.rigId,
+          nodeId: session.nodeId,
+          sessionId: session.id,
+          sessionName,
+          attentionClass: "restore_outcome",
+          code: restored.code,
+          ...(restored.attemptId !== undefined ? { attemptId: restored.attemptId } : {}),
+          ...(restored.probe ? { probe: restored.probe } : {}),
+        });
         return {
           ok: false,
           code: "not_demonstrably_responsive",
@@ -499,6 +542,7 @@ export class SeatAttentionReconciler {
     // Operator attestation override (--reason).
     if (opts?.reason) {
       const clearedClasses: ("startup_status" | "restore_outcome" | "pane_identity")[] = [];
+      const acknowledgeRestore = derivedOutcome?.source === "restore.subset_completed" || assistedRestore !== undefined;
       if (startupClassActive) {
         sessionRegistry.updateStartupStatus(session.id, "ready", new Date().toISOString());
         eventBus.emit({
@@ -514,12 +558,12 @@ export class SeatAttentionReconciler {
         });
         clearedClasses.push("startup_status");
       }
-      if (derivedOutcome?.source === "restore.subset_completed") {
+      if (derivedOutcome && acknowledgeRestore) {
         eventBus.emit({
           type: "restore.outcome_reconciled",
           rigId: session.rigId,
           nodeId: session.nodeId,
-          attemptId: 0,
+          attemptId: assistedRestore ?? 0,
           from: derivedOutcome.status,
           to: "operator_recovered",
           evidence: { source: "operator_attestation", reason: opts.reason, runtimeCwdVerified: false },
@@ -535,7 +579,7 @@ export class SeatAttentionReconciler {
         reason: opts.reason,
         previousError,
         clearedClasses,
-        derivedEvidence: derivedOutcome?.source === "restore.subset_completed"
+        derivedEvidence: acknowledgeRestore
           ? { source: "operator_attestation", reason: opts.reason, runtimeCwdVerified: false }
           : undefined,
       };
@@ -672,12 +716,14 @@ export class SeatAttentionReconciler {
     startupStatus: string;
     sessionStatus: string;
     runtime: string | null;
+    communityHarness: string | null;
     resumeToken: string | null;
     bindingPane: string | null;
     latestError: string | null;
   } | null {
     const row = this.deps.sessionRegistry.db.prepare(
       `SELECT s.id, s.node_id, n.rig_id, n.runtime, s.resume_token, b.tmux_pane, s.startup_status, s.status,
+              ${sessionCommunityHarnessSelect(this.deps.sessionRegistry.db)} AS community_harness,
               (SELECT e.payload FROM events e WHERE e.node_id = s.node_id AND e.type IN ('node.startup_attention_required','node.startup_failed') ORDER BY e.seq DESC LIMIT 1) as latest_error_payload
        FROM sessions s
        JOIN nodes n ON n.id = s.node_id
@@ -691,6 +737,7 @@ export class SeatAttentionReconciler {
       startup_status: string;
       status: string;
       runtime: string | null;
+      community_harness: string | null;
       resume_token: string | null;
       tmux_pane: string | null;
       latest_error_payload: string | null;
@@ -715,6 +762,7 @@ export class SeatAttentionReconciler {
       startupStatus: row.startup_status ?? "pending",
       sessionStatus: row.status ?? "unknown",
       runtime: row.runtime,
+      communityHarness: row.community_harness,
       resumeToken: row.resume_token,
       bindingPane: row.tmux_pane,
       latestError,
@@ -734,15 +782,20 @@ export class SeatAttentionReconciler {
     return verdict.verdict === "mismatch" || verdict.verdict === "pane_missing" ? verdict : null;
   }
 
-  private getDerivedAttentionOutcome(session: { nodeId: string; rigId: string; sessionStatus: string }): DerivedAttentionOutcome | null {
+  private getDerivedAttentionOutcome(session: { id: string; nodeId: string; rigId: string; sessionStatus: string; runtime: string | null; communityHarness: string | null }): DerivedAttentionOutcome | null {
     if (!this.deps.db) return null;
 
     const rows = this.deps.db.prepare(
-      "SELECT type, payload FROM events WHERE rig_id = ? AND type IN ('restore.completed', 'restore.subset_completed', 'restore.outcome_reconciled') ORDER BY seq DESC"
-    ).all(session.rigId) as { type: string; payload: string }[];
+      "SELECT seq, type, payload FROM events WHERE rig_id = ? AND type IN ('restore.started', 'restore.completed', 'restore.subset_completed', 'restore.outcome_reconciled') ORDER BY seq DESC"
+    ).all(session.rigId) as { seq: number; type: string; payload: string }[];
+    // As in the inventory projection: an attempt that started before the
+    // node's ready fresh launch describes the retired occupant.
+    const fence = readReadyFreshLaunchFences(this.deps.db, session.rigId).get(session.nodeId);
+    const fenced = (attemptSeq: number) => fence !== undefined && attemptSeq < fence;
 
     let sawLegacyReconciliation = false;
     for (const row of rows) {
+      if (row.type === "restore.started") continue;
       try {
         if (row.type === "restore.outcome_reconciled") {
           const ev = JSON.parse(row.payload) as { nodeId: string; attemptId?: number; to: "operator_recovered" };
@@ -759,15 +812,38 @@ export class SeatAttentionReconciler {
         const ev = JSON.parse(row.payload) as { result: { nodes: Array<{ nodeId: string; status: string }> } };
         const n = ev.result.nodes.find((nd) => nd.nodeId === session.nodeId);
         if (!n) continue;
+        // A full restore's attempt starts at its restore.started; a subset
+        // restore records no start, so its completion is all there is.
+        const attemptSeq = row.type === "restore.completed"
+          ? rows.find((r) => r.type === "restore.started" && r.seq < row.seq)?.seq ?? row.seq
+          : row.seq;
+        if (fenced(attemptSeq)) return null;
         if (sawLegacyReconciliation && row.type === "restore.subset_completed") return null;
         // Mirror deriveNodeLifecycleState: attention_required regardless of
         // sessionStatus; failed only when sessionStatus=running.
         const source = row.type as DerivedAttentionOutcome["source"];
-        if (n.status === "attention_required") return { status: "attention_required", source };
+        if (n.status === "attention_required") {
+          // Only this occupant's explicit assisted-startup outcome inside this attempt can be acknowledged.
+          // Native identity failures and unrelated/stale community failures still require strict reconciliation.
+          const assisted = source === "restore.completed" && communityHarnessOf(session.communityHarness, session.runtime)
+            && this.assistedStartupInAttempt(session, attemptSeq, row.seq);
+          return { status: "attention_required", source, ...(assisted ? { assistedStartupAttemptId: attemptSeq } : {}) };
+        }
         if (n.status === "failed" && session.sessionStatus === "running") return { status: "failed", source };
         return null;
       } catch { continue; }
     }
     return null;
+  }
+
+  private assistedStartupInAttempt(session: { id: string; nodeId: string }, attemptId: number, completedSeq: number): boolean {
+    const latest = this.deps.db!.prepare(
+      "SELECT seq, payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending','node.startup_ready','node.startup_failed') ORDER BY seq DESC LIMIT 1",
+    ).get(session.nodeId) as { seq: number; payload: string } | undefined;
+    if (!latest || latest.seq <= attemptId || latest.seq >= completedSeq) return false;
+    try {
+      const event = JSON.parse(latest.payload);
+      return event.type === "node.startup_failed" && event.sessionId === session.id && event.stage === "assisted_startup";
+    } catch { return false; }
   }
 }
