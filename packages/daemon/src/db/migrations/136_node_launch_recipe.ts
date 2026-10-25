@@ -7,6 +7,6 @@ import type { Migration } from "../migrate.js";
  * topology/configuration source for rebuilding that seat.
  */
 export const nodeLaunchRecipeSchema: Migration = {
-  name: "116_node_launch_recipe.sql",
+  name: "136_node_launch_recipe.sql",
   sql: `ALTER TABLE nodes ADD COLUMN launch_recipe_json TEXT;`,
 };

@@ -61,23 +61,41 @@ describe("persisted pod-aware launch recipes", () => {
 
   it("keeps saved seat choices authoritative over the recipe defaults", async () => {
     db = createFullTestDb();
-    const setup = createTestApp(db);
+    const launchHarness = vi.fn(async () => ({ ok: true as const }));
+    const agentYaml = `name: impl\nversion: "1.0.0"\nresources:\n  skills: []\n  guidance: []\n  subagents: []\n  plugins: []\n  runtime_resources: []\nprofiles:\n  default: {}\n`;
+    const setup = createTestApp(db, {
+      adapters: {
+        codex: {
+          runtime: "codex",
+          listInstalled: async () => [],
+          project: async () => ({ projected: [], skipped: [], failed: [] }),
+          deliverStartup: async () => ({ delivered: 0, failed: [] }),
+          checkReady: async () => ({ ready: true }),
+          launchHarness,
+        },
+      },
+      podInstantiatorFsOps: {
+        exists: (file) => file.replaceAll("\\", "/").endsWith("/agents/impl/agent.yaml"),
+        readFile: () => agentYaml,
+      },
+    });
     const rig = setup.rigRepo.createRig("saved-choice-rig");
     db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)")
       .run("pod-saved-choice", rig.id, "dev", "Development");
 
+    const rigRoot = process.cwd();
     const node = setup.rigRepo.addNode(rig.id, "dev.impl", {
       runtime: "codex",
       model: "saved-model",
       effort: "saved-effort",
       codexConfigProfile: "saved-profile",
-      permissionPolicy: "builtin:team",
+      permissionPolicy: "builtin:yolo",
       env: { SAVED_CHOICE: "yes" },
-      cwd: "/saved/cwd",
+      cwd: rigRoot,
       podId: "pod-saved-choice",
       launchRecipe: {
         version: 1,
-        rigRoot: "/workspace/saved-choice-rig",
+        rigRoot,
         rigSpec: {
           version: "0.2",
           name: "saved-choice-rig",
@@ -101,18 +119,16 @@ describe("persisted pod-aware launch recipes", () => {
       },
     });
 
-    const launchBinding = vi.spyOn(setup.podInstantiator, "launchBinding")
-      .mockResolvedValue({ status: "launched" });
-    await setup.podInstantiator.launchPersistedFresh(rig.id, node.id);
+    const result = await setup.podInstantiator.launchPersistedFresh(rig.id, node.id);
 
-    expect(launchBinding.mock.calls[0]?.[0].member).toEqual(expect.objectContaining({
+    expect(result).toMatchObject({ status: "launched" });
+    expect(launchHarness).toHaveBeenCalledWith(expect.objectContaining({
       model: "saved-model",
       effort: "saved-effort",
       codexConfigProfile: "saved-profile",
-      permissionPolicy: "builtin:team",
-      env: { SAVED_CHOICE: "yes" },
-      cwd: "/saved/cwd",
-    }));
+      cwd: rigRoot,
+      launchPosture: "full_bypass",
+    }), expect.anything());
   });
 
   it("rejects malformed stored specs without throwing", async () => {
@@ -167,6 +183,20 @@ describe("persisted pod-aware launch recipes", () => {
           version: "0.2",
           name: "broken",
           pods: [{ id: "dev", label: "Dev", continuityPolicy: { enabled: "yes" }, members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
+          edges: [],
+        },
+      },
+    },
+    {
+      label: "malformed nested appliesOn phase",
+      value: {
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "broken",
+          startup: { files: [], actions: [{ type: "send_text", value: "hello", phase: "after_ready", idempotent: true, appliesOn: [["fresh_start"]] }] },
+          pods: [{ id: "dev", label: "Dev", members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
           edges: [],
         },
       },
@@ -256,9 +286,9 @@ describe("persisted pod-aware launch recipes", () => {
     });
     const session = setup.sessionRegistry.registerSession(node.id, "dev-impl@reopened-recipe-rig");
     setup.sessionRegistry.updateStatus(session.id, "running");
+    setup.sessionRegistry.updateBinding(node.id, { tmuxPane: "%7" });
     const snapshot = setup.snapshotCapture.captureSnapshot(rig.id, "recipe-reopen");
     setup.sessionRegistry.updateStatus(session.id, "exited");
-    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
 
     const result = await setup.restoreOrchestrator.restore(snapshot.id, {
       adapters: { codex: runtimeAdapter },
@@ -273,8 +303,85 @@ describe("persisted pod-aware launch recipes", () => {
   });
 
   it.each([
+    { label: "no recipe", mutate: (db: Database.Database, nodeId: string) => db.prepare("UPDATE nodes SET launch_recipe_json = NULL WHERE id = ?").run(nodeId) },
+    { label: "invalid JSON", mutate: (db: Database.Database, nodeId: string) => db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run("{", nodeId) },
+    {
+      label: "malformed member addition",
+      mutate: (db: Database.Database, nodeId: string) => db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run(JSON.stringify({
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "restore-fallback-rig",
+          pods: [{ id: "dev", label: "Development", members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: ".", pluginDirs: "not-an-array" }], edges: [] }],
+          edges: [],
+        },
+      }), nodeId),
+    },
+    {
+      label: "recipe missing this node's member",
+      mutate: (db: Database.Database, nodeId: string) => db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?").run(JSON.stringify({
+        version: 1,
+        rigRoot: "/workspace",
+        rigSpec: {
+          version: "0.2",
+          name: "restore-fallback-rig",
+          pods: [{ id: "dev", label: "Development", members: [{ id: "other", agentRef: "local:agents/other", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
+          edges: [],
+        },
+      }), nodeId),
+    },
+  ])("keeps the provisional shell and binding for $label", async ({ mutate }) => {
+    db = createFullTestDb();
+    let setup!: ReturnType<typeof createTestApp>;
+    const freshLaunch = vi.fn(async (rigId: string, nodeId: string) => setup.podInstantiator.launchPersistedFresh(rigId, nodeId));
+    const freshLaunchAvailable = vi.fn((rigId: string, nodeId: string) => setup.podInstantiator.canLaunchPersistedFresh(rigId, nodeId));
+    setup = createTestApp(db, { freshLaunch, freshLaunchAvailable });
+    const rig = setup.rigRepo.createRig("restore-fallback-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)")
+      .run("pod-restore-fallback", rig.id, "dev", "Development");
+    const recipe = {
+      version: 1,
+      rigRoot: "/workspace",
+      rigSpec: {
+        version: "0.2",
+        name: "restore-fallback-rig",
+        pods: [{ id: "dev", label: "Development", members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "codex", cwd: "." }], edges: [] }],
+        edges: [],
+      },
+    };
+    const node = setup.rigRepo.addNode(rig.id, "dev.impl", {
+      runtime: "codex",
+      agentRef: "local:agents/impl",
+      profile: "default",
+      cwd: process.cwd(),
+      podId: "pod-restore-fallback",
+      launchRecipe: recipe,
+    });
+    const session = setup.sessionRegistry.registerSession(node.id, "dev-impl@restore-fallback-rig");
+    setup.sessionRegistry.updateStatus(session.id, "running");
+    const snapshot = setup.snapshotCapture.captureSnapshot(rig.id, "recipe-fallback");
+    mutate(db, node.id);
+    setup.sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+    const result = await setup.restoreOrchestrator.restore(snapshot.id, { freshLogicalIds: [node.logicalId] });
+
+    expect(result).toMatchObject({ ok: true });
+    if (result.ok) expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({ status: "attention_required" });
+    expect(freshLaunchAvailable).toHaveBeenCalledWith(rig.id, node.id);
+    expect(freshLaunch).not.toHaveBeenCalled();
+    expect(setup.sessionRegistry.getSessionsForRig(rig.id).some((entry) => entry.nodeId === node.id && entry.status === "running")).toBe(true);
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toEqual(expect.objectContaining({ tmuxSession: expect.any(String) }));
+  });
+
+  it.each([
     { label: "permission policy", field: "permissionPolicy", value: {} },
     { label: "environment", field: "env", value: [] },
+    { label: "advisor", field: "advisor", value: [] },
+    { label: "agent file", field: "agentFile", value: 42 },
+    { label: "append system prompt file", field: "appendSystemPromptFile", value: 42 },
+    { label: "plugin directories", field: "pluginDirs", value: "not-an-array" },
     { label: "session source", field: "sessionSource", value: { mode: "rebuild", ref: { kind: "artifact_set", value: "not-an-array" } } },
     { label: "starter reference", field: "starterRef", value: { name: 42 } },
   ])("rejects malformed optional $label inputs without throwing", async ({ field, value }) => {

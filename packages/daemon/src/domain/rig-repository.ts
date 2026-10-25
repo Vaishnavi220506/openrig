@@ -69,7 +69,7 @@ function isStoredStartupBlock(value: unknown): boolean {
       && fileHints.includes(String(entry.deliveryHint))
       && typeof entry.required === "boolean"
       && Array.isArray(entry.appliesOn)
-      && entry.appliesOn.every((phase) => phases.includes(String(phase)))
+      && entry.appliesOn.every((phase) => typeof phase === "string" && phases.includes(phase))
       && (entry.orientation === undefined || entry.orientation === "role")
       && (entry.kind === undefined || entry.kind === "file");
   }) && startup.actions.every((action) => {
@@ -79,7 +79,7 @@ function isStoredStartupBlock(value: unknown): boolean {
       && typeof entry.value === "string"
       && actionPhases.includes(String(entry.phase))
       && Array.isArray(entry.appliesOn)
-      && entry.appliesOn.every((phase) => phases.includes(String(phase)))
+      && entry.appliesOn.every((phase) => typeof phase === "string" && phases.includes(phase))
       && typeof entry.idempotent === "boolean"
       && (entry.builtin === undefined || entry.builtin === "session_identity");
   });
@@ -167,6 +167,11 @@ function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
         && (entry.model === undefined || typeof entry.model === "string")
         && (entry.effort === undefined || typeof entry.effort === "string")
         && (entry.role === undefined || typeof entry.role === "string")
+        && (entry.advisor === undefined || typeof entry.advisor === "string")
+        && (entry.agentFile === undefined || typeof entry.agentFile === "string")
+        && (entry.appendSystemPromptFile === undefined || typeof entry.appendSystemPromptFile === "string")
+        && (entry.pluginDirs === undefined
+          || (Array.isArray(entry.pluginDirs) && entry.pluginDirs.every((dir) => typeof dir === "string")))
         && (entry.permissionPolicy === undefined || typeof entry.permissionPolicy === "string")
         && (entry.env === undefined || isStringRecord(entry.env))
         && (entry.restorePolicy === undefined || typeof entry.restorePolicy === "string")
