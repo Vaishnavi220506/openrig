@@ -3378,8 +3378,9 @@ export class SessionTransport {
    * Null when no shell label is observed, or the expected native process is verified. */
   private async unverifiedShellForeground(sessionName: string, runtime: string, pane: string | null, resumeToken: string | null): Promise<string | null> {
     let paneCommand: string | null;
+    const readTarget = pane ?? sessionName;
     try {
-      paneCommand = await this.tmuxAdapter.getPaneCommand(sessionName);
+      paneCommand = await this.tmuxAdapter.getPaneCommand(readTarget);
     } catch {
       return null;
     }
@@ -3388,7 +3389,7 @@ export class SessionTransport {
       // Reuse stable, foreground, pane-descendant Codex proof. A resumed process
       // must name this session's token. Stale UI, a Node
       // launcher alone, missing observations or a native process elsewhere cannot clear it.
-      const native = await verifyCodexPaneProcess({ target: sessionName, tmux: this.tmuxAdapter,
+      const native = await verifyCodexPaneProcess({ target: readTarget, tmux: this.tmuxAdapter,
         listProcesses: this.listProcesses, expectedToken: resumeToken });
       if (native && await this.tmuxAdapter.getPanePid(pane).catch(() => null) === native.panePid) return null;
     }
@@ -3458,7 +3459,7 @@ export class SessionTransport {
             tmuxAdapter: this.tmuxAdapter,
             now,
             captureObserver: privateInput ? undefined : this.captureObserver,
-            binding: input.binding,
+            binding,
           });
           if (paneVeto.state === "needs_input") return paneVeto;
         }
