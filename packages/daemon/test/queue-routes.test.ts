@@ -1300,6 +1300,19 @@ describe("queue routes", () => {
       expect(source.source_session).toBe("b@r");
     });
 
+    it("unclaim — rejects a caller whose identity is not the assigned destination", async () => {
+      const qitemId = await createAndClaim("b@r");
+      const res = await app.request(`/api/queue/${qitemId}/unclaim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": "other@r" },
+        body: JSON.stringify({ reason: "release someone else's work" }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()) as { error: string }).toMatchObject({ error: "unclaim_destination_mismatch" });
+      expect(queueRepo.getById(qitemId)?.state).toBe("in-progress");
+    });
+
     it("create — a self-host-suffixed sender is stored as the bare local source", async () => {
       const res = await post("/api/queue/create", `orch@r@${SELF}`, { destinationSession: "b@r", body: "x" });
       expect(res.status).toBeLessThan(300);

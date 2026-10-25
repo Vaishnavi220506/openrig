@@ -2655,6 +2655,12 @@ export class QueueRepository {
     if (!qitem) {
       throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
     }
+    if (!this.resolveSessionAddresses(destinationSession).includes(qitem.destinationSession)) {
+      throw new QueueRepositoryError(
+        "unclaim_destination_mismatch",
+        `qitem ${qitemId} destination is ${qitem.destinationSession}, not ${destinationSession}`,
+      );
+    }
     if (qitem.state !== "in-progress") {
       throw new QueueRepositoryError(
         "qitem_not_in_progress",

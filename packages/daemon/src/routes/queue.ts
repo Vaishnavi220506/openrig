@@ -191,6 +191,7 @@ export function queueRoutes(): Hono {
         : err.code === "reopen_note_required" ? 400
         : err.code === "reopen_not_applicable" ? 400
         : err.code === "claim_destination_mismatch" ? 403
+        : err.code === "unclaim_destination_mismatch" ? 403
         : err.code === "qitem_not_claimable" ? 409
         : err.code === "qitem_not_in_progress" ? 409
         : err.code === "qitem_already_terminal" ? 409
